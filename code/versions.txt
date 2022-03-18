@@ -1,0 +1,5 @@
+List of versions:
+
+Version 1: Deterministic model. Only age in the state space.
+
+Version 2: Added stochasticity.
