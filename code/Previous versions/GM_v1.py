@@ -1,7 +1,9 @@
 
 #%%
+
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from types import SimpleNamespace
 
 
@@ -121,6 +123,51 @@ class GM:
         # som ikke findes endnu. Det skal nok gå. Måske lav 2 types også, så vi kan få nogle cross-terms
         #?
 
+    def simulate(self):
+        """Primitive function for simulating individuals forward"""
+        c = self.sol.c
+
+        #initialize 2 persons at each age and simulate 35 periods forward. Do not generate new cohorts.
+        #This means we create 36 cohorts and let the number of cohorts decrease by 1 each year.
+        N_sim = self.par.N_ages * 2
+        ss = np.zeros((N_sim, self.par.T), dtype=int) - 1 #only 1-dimensional apart from N x T since the i-specific part of state space only consists of age
+        sol = np.zeros((N_sim, self.par.T), dtype=int) - 1
+
+        #Initialize the state space
+        ss[:, 0] = self.par.ages.repeat(2)
+
+        #Loop forward through years
+        for t in np.arange(self.par.T):
+            active_i = ss[:, t] <= 65 #only do calculations on people who are active in the labor market
+            i = ss[active_i, t] - self.par.a_min
+            sol[active_i, t] = c[i, t]
+            if t < self.par.T - 1:
+                #Transition function (add 1 to age)
+                ss[:, t + 1] = ss[:, t] + 1
+
+        self.sim.sol = sol
+        self.sim.ss = ss
+
+    def fig_employment(self):
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        df = pd.DataFrame(self.sim.sol, dtype=float)
+        df[df < 0] = np.nan
+
+        translate = {
+            0:"Unemployment",
+            1:"Clean",
+            2:"Dirty"
+        }
+
+        df.replace(translate, inplace=True)
+        data = df.apply(pd.value_counts).replace(np.nan, 0).transpose()
+        for col in data.columns:
+            ax.plot(data.index, data[col], label=col)
+
+        ax.legend()
+        fig.savefig("Employment_v1.pdf")
+
 
 
 # %% Testing
@@ -129,14 +176,9 @@ gm = GM()
 gm.setup()
 gm.create_human_capital_unit_prices()
 gm.allocate()
-
 gm.solve()
-
-#%%
-
-
-#%%
-gm.sol.c
+gm.simulate()
+gm.fig_employment()
 
 
 
