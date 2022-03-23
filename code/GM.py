@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from types import SimpleNamespace
-np.set_printoptions(precision=2)
+np.set_printoptions(precision=3)
 
 #%%
 
@@ -77,7 +77,7 @@ class GM:
     def EV_closedform(sigma, arr, axis=0):
         return sigma * np.log(np.sum(np.exp(arr / sigma), axis))
 
-    #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere?
+    #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
     @staticmethod
     def CCP_closedform(sigma, arr, axis=0):
         if arr.ndim <= 1:
@@ -140,27 +140,53 @@ class GM:
     def simulate(self):
         """Primitive function for simulating individuals forward"""
         c = self.sol.c
+        par = self.par
 
-        #initialize 2 persons at each age and simulate 35 periods forward. Do not generate new cohorts.
-        #This means we create 36 cohorts and let the number of active cohorts decrease by 1 each year.
-        N_sim = self.par.N_ages * 2
-        ss = np.zeros((N_sim, self.par.T), dtype=int) - 1 #only 1-dimensional apart from N x T since the i-specific part of state space only consists of age
-        sol = np.zeros((N_sim, self.par.T), dtype=int) - 1
+        #Measure how large a fraction of the people are at each point in the {state space x sector}.
+        density = np.zeros((par.N_ages, par.S, par.T))
 
-        #Initialize the state space
-        ss[:, 0] = self.par.ages.repeat(2)
+        #This should be based on data later. Here we assume that all points in the state space are equally populated
+        density[:, :, 0] = 1 / (par.N_ages * par.S)
+        assert np.around(np.sum(density[:, :, 0], axis=(0, 1)), 7) == 1
 
-        #Loop forward through years
-        for t in np.arange(self.par.T):
-            active_i = ss[:, t] <= 65 #only do calculations on people who are active in the labor market
-            i = ss[active_i, t] - self.par.a_min
-            sol[active_i, t] = c[i, t]
-            if t < self.par.T - 1:
-                #Transition function (add 1 to age)
-                ss[:, t + 1] = ss[:, t] + 1
+        #loop over t starting from t = 0 going until the second to last period (which inserts values into the last). We only replace values in density in years 1, 2, ... 
+        #Since the starting year is data.
+        for t in np.arange(1, par.T):
+            #The non-standard part is making sure people come into the model with age 30. 
+            density[0, :, t] = np.sum(density[-1, :, t-1]) * c[0, :, t]
+            #What will people of ages 31-65 do in this period.
+            density[1:, :, t] = np.sum(density[0:-1, :, t-1], axis=1)[:, np.newaxis] * c[1:, :, t]
 
-        self.sim.sol = sol
-        self.sim.ss = ss
+#%%
+
+
+
+
+
+
+#initialize 2 persons at each age and simulate 35 periods forward. Do not generate new cohorts.
+#This means we create 36 cohorts and let the number of active cohorts decrease by 1 each year.
+# N_sim = self.par.N_ages * 2
+
+ss = np.zeros((N_sim, self.par.T), dtype=int) - 1 #only 1-dimensional apart from N x T since the i-specific part of state space only consists of age
+sol = np.zeros((N_sim, self.par.T), dtype=int) - 1
+
+
+
+#Initialize the state space
+ss[:, 0] = self.par.ages.repeat(2)
+
+#Loop forward through years
+for t in np.arange(self.par.T):
+    active_i = ss[:, t] <= 65 #only do calculations on people who are active in the labor market
+    i = ss[active_i, t] - self.par.a_min
+    sol[active_i, t] = c[i, t]
+    if t < self.par.T - 1:
+        #Transition function (add 1 to age)
+        ss[:, t + 1] = ss[:, t] + 1
+
+    self.sim.sol = sol
+    self.sim.ss = ss
 
     def fig_employment(self):
         fig = plt.figure()
