@@ -24,10 +24,7 @@ class GM:
         else:
             self.name = name
 
-        self.resultspath = "../results/"
-        self.version = "v3"
-
-    def setup(self):
+    def setup(self, **kwargs):
         """ Initiates parameter values at their default values"""
         
         par = self.par
@@ -51,29 +48,11 @@ class GM:
         par.sigma = 1
 
         #Parameters to estimate later
-        #Human capital function parameters
-        par.beta0 = np.array([0.002, 0.006, 0.012]) #1-dimensional over sectors. 
+        par.beta0 = np.array([0.002, 0.006, 0.012]) #1-dimensional over sectors
 
-        #Switching costs (direct utility costs)
-        if self.name == "high_switchingcost":
-            par.xi_in = 20 * np.array([0.04, 0.05, 0.06])
-            par.xi_out = 20 * np.array([0.03, 0.06, 0.09]).transpose()    
-        else:
-            par.xi_in = np.array([0.04, 0.05, 0.06])
-            par.xi_out = np.array([0.03, 0.06, 0.09]).transpose()
-        self.compute_switching_cost_matrix()
-
-        # #Replace default values by those given explicitly to the method
-        # for k, v in kwargs.items():
-        #     setattr(self, k, v)
-
-    def compute_switching_cost_matrix(self):
-        par = self.par
-
-        #Switching cost (SC) has dimensions (s_{t-1} x s_{t}) i.e. (s_out x s_in)
-        par.SC = sum(np.meshgrid(par.xi_in, par.xi_out)) #add cost of going OUT of a sector with the cost of going IN to a sector.
-        np.fill_diagonal(par.SC, 0) #Not switching sector is costless
-        par.SC = np.exp(par.SC)
+        #Replace default values by those given explicitly to the method
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
     # def create_grids(self):
     #     """ grids for experience """
@@ -94,8 +73,8 @@ class GM:
         sol = self.sol
         par = self.par
 
-        sol.c = np.zeros((par.S, par.N_ages, par.S, par.T)) - 1 #4 dimensions: previous sector, age, chosen sector, time
-        sol.v = np.zeros((par.S, par.N_ages, par.T)) - 99 #3 dimensions: previous sector, current age, time period
+        sol.c = np.zeros((par.N_ages, par.S, par.T)) - 1
+        sol.v = np.zeros((par.N_ages, par.T)) - 99
 
     def precompute(self):
         """ Calculates the wages offered in each sector at each point in the state space. 
@@ -129,7 +108,6 @@ class GM:
 
         #Unpack solution objects
         w = sol.w #offered wages.
-        SC = par.SC #utility switching cost
         c = sol.c #conditional choice probabilities
         v = sol.v #expected value functions
 
@@ -138,23 +116,16 @@ class GM:
         a = par.N_ages - 1
 
         #Start at the retirement age, where there are no continuation values
-        #Loop over different lagged sectors (slag)
-
-        for slag in np.arange(0, par.S):
-            v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - SC[slag, :])
-            c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - SC[slag, :])
+        v[a, t] = self.EV_closedform(par.sigma, w[a, :, t])
+        c[a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t])
 
         #Then iterate from age 64 to 30.
         # a = 34
         for a in reversed(np.arange(par.N_ages - 1)):
-            for slag in np.arange(0, par.S):
-                V_alternatives = w[a, :, t] - SC[slag, :] + par.rho * v[:, a + 1, t]
-                #Nemt her stadig pga. simpel transformation function.
-                #når valget i dag påvirker min state i morgen kommer det ind her.
-                #Version 3: da mit valg i dag bare er det samme som min state i morgen kan jeg bare tilføje
-                #v[:, ...] og stadig få den korrekte continuation value.
-                v[slag, a, t] = self.EV_closedform(par.sigma, V_alternatives)
-                c[slag, a, :, t] = self.CCP_closedform(par.sigma, V_alternatives)
+            V_alternatives = w[a, :, t] + par.rho * v[a + 1, t] #Nemt her stadig pga. simpel transformation function.
+                                                                #når valget i dag påvirker min state i morgen kommer det ind her.
+            v[a, t] = self.EV_closedform(par.sigma, V_alternatives)
+            c[a, :, t] = self.CCP_closedform(par.sigma, V_alternatives)
 
         #PART II (time iteration from T - 2 to 0.)
         #Iterate from period T-2 (second to last period). Within each period. I don't have to iterate on age yet
@@ -162,75 +133,43 @@ class GM:
         for t in reversed(np.arange(par.T - 1)):
             #Calculate the value function when age = 65, which has no continuation value
             a = par.N_ages - 1
-            for slag in np.arange(0, par.S):
-                v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - SC[slag, :])
-                c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - SC[slag, :])
+            v[a, t] = self.EV_closedform(par.sigma, w[a, :, t])
+            c[a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t])
 
             #Calculate the value functions for ages 64 - 30
             #H[:, 0:par.N_ages - 1] * r[:, t][:, np.newaxis] bruger mindre memory men kan ikke precomputes. Hvad er bedst?
-            #Løn +SC på tværs af valget. Samme dimension er i continuation value. løn i sek 0 skal plusses med cont når jeg kommer fra sek 0.
-                V_alternatives =  w[0:par.N_ages - 1, :, t] - SC[slag, :] + par.rho*v[:, 1:, t + 1].transpose()
-                v[slag, 0:-1, t] = self.EV_closedform(par.sigma, V_alternatives, axis=1)
-                c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
-
+            V_alternatives =  w[0:par.N_ages - 1, :, t] + par.rho*v[1:, t + 1][:, np.newaxis]    
+            v[0:-1, t] = self.EV_closedform(par.sigma, V_alternatives, axis=1)
+            c[0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
 
     def simulate(self):
         """ Simulate the model forward. We initialize the model in a point where all points of the state space are equally 
         populated. Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
         use the conditional choice probabilities as transition probabilities. """
-
         c = self.sol.c
         par = self.par
 
         #Measure how large a fraction of the people are at each point in the {state space x sector}.
-        self.sim.density = np.zeros((par.S, par.N_ages, par.S, par.T))
-        density = self.sim.density
+        self.sol.density = np.zeros((par.N_ages, par.S, par.T))
+        density = self.sol.density
 
-        #This should be based on data later. Here we assume that all points in the state space are equally populated.
-        #
-        init_share = 1 / (par.S * par.N_ages * par.S)
-        density[:, :, :, 0] = init_share
-
-        #Do something different than equally populated for the sake of illustration and debugging
-        density[:, :, :, 0] += np.array([- 1/2 * init_share, 0, 1/2 * init_share])[np.newaxis, np.newaxis, :]
-        assert np.around(np.sum(density[:, :, :, 0]), 7) == 1
-
-        #Specify the distribution across the state space for entering cohorts.
-        #Eventually this could be based on the distribution of the cohort that entered the last year we have data (e.g. 2016)
-        #Right now the only part of the state space that is relevant to specify is the lagged sector choice, since a = 30 by construction.
-        #Just insert some non-uniform values
-        enter_share = 1 / par.S 
-        EnteringStateSpaceDist = np.zeros(shape=(par.S)) + enter_share + np.array([- 1/2 * enter_share, 0, 1/2 * enter_share])
+        #This should be based on data later. Here we assume that all points in the state space are equally populated
+        density[:, :, 0] = 1 / (par.N_ages * par.S)
+        assert np.around(np.sum(density[:, :, 0], axis=(0, 1)), 7) == 1
 
         #loop over t starting from t = 0 going until the second to last period (which inserts values into the last). We only replace values in density in years 1, 2, ... 
         #Since the starting year is data.
-        t = 1
         for t in np.arange(1, par.T):
-            ## How many retired at the end the previous year?
-            # The non-standard part is making sure people come into the model with age 30. 
-            # np.sum(density[:, -1, :, t - 1]) sums over all parts of the state except age and time. Because we simply need ALL retiring people.
-            retiring = np.sum(density[:, -1, :, t - 1])
-            ## Entering cohort:
-            density[:, 0, :, t] = retiring * EnteringStateSpaceDist[:, np.newaxis] * c[:, 0, :, t]
-
-            ## What will people of ages 31-65 do in this period.
-            # The transpose moves the sector dimension in front of the age dimension. This is intuitive, since the current sector
-            # becomes next period's lagged sector. And it needs to line up with the policy function which has dimensions
-            # (s_lag, age, s_curr, time) 
-            # We sum over period t-2 sectors (previous period's lagged sector) since they do not matter
-            # for current choices.
-            density[:, 1:, :, t] = np.sum(density[:, 0:-1, :, t-1], axis=0).transpose()[:, :, np.newaxis] * c[:, 1:, :, t]
-
-        assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
-
-    def savefig(self, fig, figname):
-        fig.savefig(self.resultspath + figname +  "_" + self.name + "_" + self.version + ".pdf", bbox_inches='tight')
+            #The non-standard part is making sure people come into the model with age 30. 
+            density[0, :, t] = np.sum(density[-1, :, t-1]) * c[0, :, t]
+            #What will people of ages 31-65 do in this period.
+            density[1:, :, t] = np.sum(density[0:-1, :, t-1], axis=1)[:, np.newaxis] * c[1:, :, t]
 
     def fig_employment_shares(self):
         """ Creates a figure of employment shares in each sector, over time"""
         #Unpack
-        d = np.sum(self.sim.density, axis=(0, 1))
+        d = np.sum(self.sol.density, axis=0)
         sector_names = self.par.sector_names
 
         fig = plt.figure(figsize=(6, 4), dpi=100)
@@ -239,12 +178,12 @@ class GM:
         for i, name in enumerate(sector_names):
             ax.plot(d[i, :], label=name)
 
-        ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
+        ax.legend(loc='upper left',frameon=True)
         ax.set_xlabel("Time")
         ax.set_ylabel("Employment share")
-        ax.set_title("Employment shares over time")
+        ax.set_title("Title")
 
-        self.savefig(fig, "Employment_shares")
+        fig.savefig("Employment_shares_" + self.name + ".pdf")
 
     def fig_avg_wages(self):
         """ Creates a figure of average wages across ages, over time"""
@@ -252,31 +191,19 @@ class GM:
         w = np.mean(self.sol.w, 0)
         sector_names = self.par.sector_names
         
-        fig = plt.figure(figsize=(6, 5), dpi=100)
+        fig = plt.figure(figsize=(6, 4), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
 
         for i, name in enumerate(sector_names):
             ax.plot(w[i, :], label=name)
 
-        ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
+        ax.legend(loc='upper left',frameon=True)
         ax.set_xlabel("Time")
-        ax.set_title("Average wages")
         ax.set_ylabel("Average wage across ages")
 
-        self.savefig(fig, "Average_wages")
+        fig.savefig("Average_wages_" + self.name + ".pdf")
 
 # %% Run
-
-gm = GM("high_switchingcost")
-gm.setup()
-gm.create_human_capital_unit_prices()
-gm.allocate()
-gm.precompute()
-gm.solve()
-gm.simulate()
-gm.fig_avg_wages()
-gm.fig_employment_shares()
-#%%
 
 gm = GM()
 gm.setup()
@@ -285,16 +212,12 @@ gm.allocate()
 gm.precompute()
 gm.solve()
 gm.simulate()
+
+
+#%%
+
 gm.fig_avg_wages()
 gm.fig_employment_shares()
-
-
-
-#%%
-
-
-#%%
-
 
 #%% Shocked system
 
