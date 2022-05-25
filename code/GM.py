@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from types import SimpleNamespace
 np.set_printoptions(precision=3)
 
+import seaborn as sns
+sns.set_theme()
 # import warnings
 # warnings.filterwarnings("error")
 
@@ -22,6 +24,8 @@ class GM:
         self.results = SimpleNamespace()
         self.results.tables = SimpleNamespace()
         self.results.figures = SimpleNamespace()
+        self.diag = SimpleNamespace()
+        self.diag.tables = SimpleNamespace()
 
         if name is None:
             self.name = "standard"
@@ -45,14 +49,29 @@ class GM:
         par.ages = np.arange(par.a_min, par.a_max + 1)
         par.N_ages = par.a_max + 1 - par.a_min
         
+        #Meta-settings
+        sol = self.sol
+        sol.step_fraction = 0.05
+        sol.maxiter = 500
+        sol.tolerance_r = 0.0001
+
         #Not used
         # par.exper_min = 1e-6 # minimum point in grid for experience
         # par.exper_max = 20.0 # maximum point in grid for experience
         # par.gridpoints_exper = 200 #number of gridpoints for experience
 
+        #Fixed quantities from data
+        par.MASS = self.load_MASS()
+        par.pY = self.load_nominal_output()
+
         #Parameters that are calibrated
         par.rho = 0.96
         par.sigma = 1
+
+        #Should be loaded later
+        par.alpha1 = np.repeat(np.array([0.2, 0.3, 0.4])[:, np.newaxis], par.T, axis=1)
+        par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2])[:, np.newaxis], par.T, axis=1)
+        par.alpha3 = 1 - par.alpha1 - par.alpha2
 
         #Parameters to estimate later
         #Human capital function parameters
@@ -66,6 +85,12 @@ class GM:
             par.xi_in = np.array([0.04, 0.05, 0.06])
             par.xi_out = np.array([0.03, 0.06, 0.09]).transpose()
         self.compute_switching_cost_matrix()
+
+        self.diag.tables.skillprice_converge = pd.DataFrame(np.nan, 
+                                                             index=pd.MultiIndex.from_product([gm.par.sector_names, range(gm.par.T)], 
+                                                                                              names=["Sector", "Year"]), 
+                                                             columns=pd.MultiIndex.from_product([["r0", "r1"], range(0, gm.sol.maxiter)], 
+                                                             names=["Pre/post", "Iteration"]))
 
         # #Replace default values by those given explicitly to the method
         # for k, v in kwargs.items():
@@ -93,6 +118,13 @@ class GM:
         #first dimension: sector. Second dimension: time.
         # par.r = np.random.uniform(1, 10, size=(par.T, par.sectors))
 
+    def load_MASS(self):
+        #for testing, this makes the population double halfway through the sample
+        return np.concatenate([np.ones(int(round(self.par.T/2, 0))), np.ones(self.par.T - int(round(self.par.T/2, 0))) + 1])
+
+    def load_nominal_output(self):
+        return np.repeat((np.ones(self.par.S))[:, np.newaxis], self.par.T, axis=1)
+
     def allocate(self):
         """ allocate empty containers for solution. 
         c contains the CCPs and v contains expected value functions"""
@@ -106,9 +138,14 @@ class GM:
         """ Calculates the wages offered in each sector at each point in the state space. 
         The result is sol.w which we can then use directly, rather than using r and H """
         #Precompute (for all ages) human capital #H has dimensions: s x a
+        self.precompute_H()
+        #Precompute wages (a x s x t) = (36, 3, 4)
+        self.precompute_w()
+
+    def precompute_H(self):
         self.sol.H = np.exp(self.par.beta0[:, np.newaxis] * self.par.ages)
 
-        #Precompute wages (a x s x t) = (36, 3, 4)
+    def precompute_w(self):
         self.sol.w = np.transpose(self.sol.H)[:, :, np.newaxis] * self.par.r[np.newaxis, :, :]
 
     @staticmethod
@@ -125,8 +162,8 @@ class GM:
         else:
             return np.divide(np.exp(arr / sigma), np.sum(np.exp(arr / sigma), axis)[:, np.newaxis])
 
-    def solve(self):
-        """ Solve model by backwards induction. First we solve the last period using static
+    def solve_worker(self):
+        """ Solve model by backwards induction for a given set of skill prices. First we solve the last period using static
         expectations. Then we perform backwards iteration from the remaining periods until period t = 0
         using rational expectations. """
         par = self.par
@@ -179,8 +216,10 @@ class GM:
                 c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
 
 
+
     def simulate(self):
-        """ Simulate the model forward. We initialize the model in a point where all points of the state space are equally 
+        """ Simulate the model forward for a given set of skill prices. 
+        We initialize the model in a point where all points of the state space are equally 
         populated. Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
         use the conditional choice probabilities as transition probabilities. """
@@ -228,6 +267,63 @@ class GM:
             density[:, 1:, :, t] = np.sum(density[:, 0:-1, :, t-1], axis=0).transpose()[:, :, np.newaxis] * c[:, 1:, :, t]
 
         assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
+
+    def solve_humancap_equilibrium(self):
+        #calculate the skill price consistent with human capital demand equalizing human capital supply.
+        #This presumes that the worker's problem has already been solved once for some value of wages/skill prices.
+        idx = pd.IndexSlice
+        df = self.diag.tables.skillprice_converge
+
+        #Proposed wages from the first iteration
+        r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS)
+
+        #Insert r0 and r1 for the current iteration
+        iteration = 0
+        df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
+
+        err_r = np.sum(np.abs(r1 - self.par.r))
+        for iteration in range(1, self.sol.maxiter):
+            if err_r < 0.00001:
+                print(f"Number of iterations when converged was: {iteration}")
+                break
+            else:
+                if iteration == self.sol.maxiter - 1:
+                    raise Exception(f"Human capital equilibrium could not be found after {self.sol.maxiter} iterations.")
+                #print(f"Current error of skill prices is: {err_r:.7f}")
+                #Make another iteration
+                #Update the skill prices (and wages) then resolve and simulate 
+                self.par.r = r1 * self.sol.step_fraction + self.par.r * (1 - self.sol.step_fraction)
+                self.precompute_w()
+                self.solve_worker()
+                self.simulate()
+                #Proposed skill prices (S x T)
+                r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS)
+                #Save the initial and proposed skill prices (for diagnostics plotting)
+                df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
+                #Calculate deviation
+                err_r = np.sum(np.abs(r1 - self.par.r))
+
+    def fig_skillprice_converge(self, save=False):
+        idx = pd.IndexSlice
+        df = self.diag.tables.skillprice_converge
+        #Remove nans (iterations that were not reached before convergence)
+        df = df.loc[:, ~df.isna().all(axis=0)]
+
+        fig = plt.figure(figsize=(5, 3.5), dpi=100)
+        ax = fig.add_subplot(1, 1, 1)
+        r = "r0"
+        ax.plot(df.loc[idx["Unemployment", :], idx[r, 0]].unstack(level="Sector"), marker="o", color="green")
+        ax.plot(df.loc[idx["Unemployment", :], idx[r, 5::20]].unstack(level="Sector"), color="orange", alpha=0.7)
+        ax.plot(df.loc[idx["Unemployment", :], idx[r, df.columns.get_level_values(level="Iteration")[-1]]].unstack(level="Sector"), marker="x", color="red")
+        #todo: skriv grøn: start etc. i en legend
+        #todo: latex-skrift for r og t
+        # ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
+        ax.set_xlabel("Time (t)")
+        ax.set_title("Convergence of skill prices")
+        ax.set_ylabel("Skill price (r)")
+
+        if save:
+            self.savefig(fig, "skillprice_converge")
 
     def savefig(self, fig, figname):
         fig.savefig(self.resultspath + figname +  "_" + self.name + "_" + self.version + ".pdf", bbox_inches='tight')
@@ -279,16 +375,39 @@ class GM:
         probs = np.mean(np.sum(d[:, :, :, 1:], axis=1) / np.sum(d[:, :, :, 1:], axis=(1, 2))[:, np.newaxis, :], axis=2)
         self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=gm.par.sector_names, columns=gm.par.sector_names)
 
+#%% Testing
+
+
+
 # %% Run
 
-gm = GM("high_switchingcost")
+gm = GM()
 gm.setup()
 gm.create_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
-gm.solve()
+gm.solve_worker()
 gm.simulate()
-#gm.fig_avg_wages() wages are unchanged from this shock
+gm.solve_humancap_equilibrium()
+gm.fig_skillprice_converge(save=True)
+#%%
+
+
+
+
+#%% Iterate to find equilibrium skill prices
+
+
+
+#%% Figur
+
+#Remove the nans (iterations that were not reached)
+
+
+
+#%%
+gm.simulate()
+gm.fig_avg_wages() #wages are unchanged from this shock
 gm.fig_employment_shares(save=True)
 # gm.uncond_switching_probs()
 # print(gm.results.tables.uncond_switching_probs.to_latex())
