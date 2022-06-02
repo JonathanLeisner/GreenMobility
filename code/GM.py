@@ -1,26 +1,36 @@
-
+"""  Defines the class that runs the Green Mobility (GM) project code."""
 #%%
 
+from types import SimpleNamespace
+from collections import OrderedDict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from types import SimpleNamespace
-np.set_printoptions(precision=3)
-
 import seaborn as sns
+from scipy import optimize
+from numpy.random import default_rng
+
+
+np.set_printoptions(precision=3)
 sns.set_theme()
 # import warnings
 # warnings.filterwarnings("error")
+
+#%%
+
+
 
 
 #%%
 
 class GM:
-    """ Class to solve the model presented in Leisner (2023)"""
+    """ Class to solve the model presented in Leisner (2023). 
+    Generally, the notation c_[name] for methods means construct/create/calculate an object or attribute called [name]."""
     def __init__(self, name = None):
         self.sol = SimpleNamespace()
         self.par = SimpleNamespace()
         self.sim = SimpleNamespace()
+        self.est = SimpleNamespace()
         self.results = SimpleNamespace()
         self.results.tables = SimpleNamespace()
         self.results.figures = SimpleNamespace()
@@ -34,6 +44,7 @@ class GM:
 
         self.resultspath = "../results/"
         self.version = "v3"
+        self.rng = default_rng(123456) #seed
 
     def setup(self):
         """ Initiates parameter values at their default values"""
@@ -84,26 +95,26 @@ class GM:
         else:
             par.xi_in = np.array([0.04, 0.05, 0.06])
             par.xi_out = np.array([0.03, 0.06, 0.09]).transpose()
-        self.compute_switching_cost_matrix()
+        self.c_switching_cost_matrix()
 
         self.diag.tables.skillprice_converge = pd.DataFrame(np.nan, 
-                                                             index=pd.MultiIndex.from_product([gm.par.sector_names, range(gm.par.T)], 
-                                                                                              names=["Sector", "Year"]), 
-                                                             columns=pd.MultiIndex.from_product([["r0", "r1"], range(0, gm.sol.maxiter)], 
-                                                             names=["Pre/post", "Iteration"]))
+                                                            index=pd.MultiIndex.from_product([gm.par.sector_names, range(gm.par.T)], 
+                                                                                             names=["Sector", "Year"]), 
+                                                            columns=pd.MultiIndex.from_product([["r0", "r1"], range(0, gm.sol.maxiter)], 
+                                                                                               names=["Pre/post", "Iteration"]))
 
         # #Replace default values by those given explicitly to the method
         # for k, v in kwargs.items():
         #     setattr(self, k, v)
 
-    def compute_switching_cost_matrix(self):
+    def c_switching_cost_matrix(self):
         """ Takes the xi-parameters and constructs the matrix of switching costs."""
         par = self.par
 
         #Switching cost (SC) has dimensions (s_{t-1} x s_{t}) i.e. (s_out x s_in)
         par.SC = sum(np.meshgrid(par.xi_in, par.xi_out)) #add cost of going OUT of a sector with the cost of going IN to a sector.
         np.fill_diagonal(par.SC, 0) #Not switching sector is costless
-        par.SC = np.exp(par.SC)
+        par.SC = np.exp(par.SC) #todo: becomes non-zero here
 
     # def create_grids(self):
     #     """ grids for experience """
@@ -111,7 +122,7 @@ class GM:
     #     par.grid_exper = np.linspace(par.exper_min, par.exper_max, par.gridpoints_exper)
 
     def create_human_capital_unit_prices(self):
-        """ Human capital unit prices, the symbol r in the paper """
+        """ Human capital unit prices, the symbol r in the paper. This is just an initial value. This variable is endogenous. """
         par = self.par
         # SxT
         par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=1)
@@ -141,6 +152,7 @@ class GM:
         self.precompute_H()
         #Precompute wages (a x s x t) = (36, 3, 4)
         self.precompute_w()
+
 
     def precompute_H(self):
         self.sol.H = np.exp(self.par.beta0[:, np.newaxis] * self.par.ages)
@@ -222,7 +234,7 @@ class GM:
         We initialize the model in a point where all points of the state space are equally 
         populated. Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
-        use the conditional choice probabilities as transition probabilities. """
+        use the conditional choice probabilities as "transition" probabilities. """
 
         c = self.sol.c
         par = self.par
@@ -268,7 +280,7 @@ class GM:
 
         assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
 
-    def solve_humancap_equilibrium(self):
+    def solve_humancap_equilibrium(self, print_out=False):
         #calculate the skill price consistent with human capital demand equalizing human capital supply.
         #This presumes that the worker's problem has already been solved once for some value of wages/skill prices.
         idx = pd.IndexSlice
@@ -283,9 +295,10 @@ class GM:
 
         err_r = np.sum(np.abs(r1 - self.par.r))
         for iteration in range(1, self.sol.maxiter):
-            if err_r < 0.00001:
-                print(f"Number of iterations when converged was: {iteration}")
-                break
+            if err_r < self.sol.tolerance_r:
+                if print_out:
+                    print(f"Number of iterations when converged was: {iteration}")
+                    break
             else:
                 if iteration == self.sol.maxiter - 1:
                     raise Exception(f"Human capital equilibrium could not be found after {self.sol.maxiter} iterations.")
@@ -293,7 +306,7 @@ class GM:
                 #Make another iteration
                 #Update the skill prices (and wages) then resolve and simulate 
                 self.par.r = r1 * self.sol.step_fraction + self.par.r * (1 - self.sol.step_fraction)
-                self.precompute_w()
+                self.precompute_w() #H need not be recomputed, it is the same given parameters.
                 self.solve_worker()
                 self.simulate()
                 #Proposed skill prices (S x T)
@@ -302,6 +315,13 @@ class GM:
                 df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
                 #Calculate deviation
                 err_r = np.sum(np.abs(r1 - self.par.r))
+
+    # def post_estimation(self):
+    #     """This method calculates post-estimation quantities such as TFP (A), 
+    #         physical capital (K), clean energy (E) and dirty energy (O)"""
+    #     #This could change if we switch to the abatement form (JBE).
+        
+
 
     def fig_skillprice_converge(self, save=False):
         idx = pd.IndexSlice
@@ -375,6 +395,96 @@ class GM:
         probs = np.mean(np.sum(d[:, :, :, 1:], axis=1) / np.sum(d[:, :, :, 1:], axis=(1, 2))[:, np.newaxis, :], axis=2)
         self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=gm.par.sector_names, columns=gm.par.sector_names)
 
+    def c_pars_to_estimate(self, set_to_estimate="full"):
+        """Generally, c_ stands for 'construct'. """
+        pars_to_estimate = OrderedDict()
+        set_to_estimate = "full"
+        if set_to_estimate == "full":
+            varnames = ["beta0", "xi_in", "xi_out", "sigma"] 
+        elif set_to_estimate == "human_capital_function":
+            varnames = ["beta0"]
+        for var in varnames:
+            pars_to_estimate[var] = self.find_len_of_parameter(getattr(gm.par, var))
+        self.est.pars_to_estimate = pars_to_estimate
+
+    def c_theta0(self):
+        """Constructs a single, 1-dimensional array containing all the parameters to be estimated.
+        Requires self.pars_to_estimate to be defined. I use the name theta0 as 
+        the starting values of the paramters to be estimated. """
+        #unpack
+        pte = self.est.pars_to_estimate
+
+        theta0 = np.zeros(sum(pte.values()))
+        n = 0
+        for key, s in pte.items():
+            #s for size (length of array)
+            if s == 1:
+                theta0[n] = getattr(self.par, key)
+            elif s > 1:
+                theta0[n : n + s] = getattr(self.par, key)
+            n += s
+        self.est.theta0 = theta0
+
+    @staticmethod
+    def find_len_of_parameter(parameter):
+        if isinstance(parameter, np.ndarray):
+            return parameter.size
+        elif isinstance(parameter, (float, int)):
+            return 1
+
+    @staticmethod
+    def update_par(par, theta, pars_to_estimate):
+        n = 0
+        for key, s in pars_to_estimate.items():
+            if s == 1:
+                setattr(par, key, theta[n])
+            elif s > 1:
+                setattr(par, key, theta[n : n + s])
+            n += s
+
+    def estimate(self):
+        #Prep estimation (assumes est.pars_to_estimate is already defined)
+        theta0 = self.est.theta0
+        pte = self.est.pars_to_estimate
+        self.update_par(self.par, theta0, pte)
+        self.c_switching_cost_matrix()
+
+        print(f'objective function at starting values: {self.obj_func(theta0)}')
+
+        res = optimize.minimize(self.obj_func, theta0)
+        return res
+
+    def obj_func(self, theta):
+        self.update_par(self.par, theta, self.est.pars_to_estimate)
+        self.solve_humancap_equilibrium()
+        return (2.35 - np.sum(self.sim.density[:, :, 0, 0:5]) + np.sum(theta))**2
+
+    def c_simulated_data(self, n_individuals=1000):
+        data = pd.DataFrame(-1, 
+                            index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
+                            columns=["s", "a", "slag"]).reset_index(level="t") #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+
+        data.loc[data.t == 0, "a"] = 0
+        data.loc[data.t == 0, "slag"] = self.rng.integers(0, self.par.S, n_individuals) #Randomly generate period -1 sector choices (period 0 sector lagged)
+
+        for t in np.arange(0, self.par.T):
+            #Update from previous period if we're not in the first one
+            if t > 0:
+                #Transformation function
+                data.loc[(data.t == t), "slag"] = data.loc[(data.t == t - 1), "s"]
+                data.loc[(data.t == t), "a"] = data.loc[(data.t == t - 1), "a"] + 1
+            for a in np.arange(0, self.par.N_ages):
+                for slag in np.arange(0, self.par.S):
+                    size = len(data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"])
+                    if size > 0:
+                        #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
+                        data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a, :, t])
+            self.est.simulated_data = data
+
+        #data = pd.DataFrame(-1, index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["individual", "year"]), columns=["sector", "age", "s_lag"])
+        #data.loc[idx[:, 0], "age"] = 0
+        #data.loc[idx[:, 0], "s_lag"] = self.rng.integers(0, self.par.S, n_individuals) #Randomly generate period -1 sector choices (period 0 sector lagged)
+        
 #%% Testing
 
 
@@ -389,14 +499,59 @@ gm.precompute()
 gm.solve_worker()
 gm.simulate()
 gm.solve_humancap_equilibrium()
-gm.fig_skillprice_converge(save=True)
+gm.c_pars_to_estimate()
+gm.c_theta0()
+#%%
+#res = gm.estimate()
+self = gm
+n_individuals=100
+self.rng = default_rng(123456)
+data = pd.DataFrame(-1, 
+                    index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
+                    columns=["s", "a", "slag"]).reset_index() #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+
+
+# data = pd.DataFrame(-1, 
+#                     index=range(0, n_individuals), 
+#                     columns=["t", "s", "a", "slag"]) #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+
+#Randomly generate starting ages
+data.loc[data.t == 0, "a"] = self.rng.integers(self.par.a_min - self.par.T + 1, self.par.a_max + 1, n_individuals)
+#Update the ages through time deterministically
+for t in range(1, self.par.T):
+    data.loc[(data.t == t), "a"] = (data.loc[data.t == t - 1, "a"] + 1).values
+#Delete rows where workers are not active in the labor market anymore
+data = data.loc[((data.a <= self.par.a_max) & (data.a >= self.par.a_min))]
+
+# data[data.i == 5]
+
+#Randomly generate period -1 sector choices (period 0 sector lagged)
+data.loc[data.groupby("i").apply(lambda x: min(x.index)).values, "slag"] = self.rng.integers(0, self.par.S, n_individuals)
+
+# t = 1
+for t in np.arange(0, self.par.T):
+    #Update from previous period if we're not in the first one
+    if t > 0:
+        #Transformation function (For those that do not enter or exit, add lagged sector from previous choice)
+        data.loc[((data.t == t) & (data.a > self.par.a_min)), "slag"] = data.loc[((data.t == t - 1) & (data.a < self.par.a_max)), "s"].values #Her skal vi kun vælge dem som rent faktisk valgte noget i forrige periode
+        # data.loc[(data.t == t), "a"] = data.loc[(data.t == t - 1), "a"] + 1
+    for a in np.arange(self.par.a_min, self.par.a_max + 1):
+        for slag in np.arange(0, self.par.S):
+            size = len(data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"])
+            #If there are any individuals characterized by this state space point:
+            if size > 0:
+                #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
+                data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a - self.par.a_min, :, t])
+    self.est.simulated_data = data
+
 #%%
 
+#todo: bounds på estimation?
 
 
+#%%
 
-#%% Iterate to find equilibrium skill prices
-
+# gm.update_par(gm.par, theta, gm.est.pars_to_estimate)
 
 
 #%% Figur
