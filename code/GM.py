@@ -46,7 +46,7 @@ class GM:
         self.version = "v3"
         self.rng = default_rng(123456) #seed
 
-    def setup(self):
+    def setup(self, **kwargs):
         """ Initiates parameter values at their default values"""
         
         par = self.par
@@ -64,7 +64,7 @@ class GM:
         sol = self.sol
         sol.step_fraction = 0.05
         sol.maxiter = 500
-        sol.tolerance_r = 0.0001
+        sol.tolerance_r = 1e-6
 
         #Not used
         # par.exper_min = 1e-6 # minimum point in grid for experience
@@ -77,9 +77,9 @@ class GM:
 
         #Parameters that are calibrated
         par.rho = 0.96
-        par.sigma = 1
+        par.sigma = 0.8
 
-        #Should be loaded later
+        #Should be loaded from data later
         par.alpha1 = np.repeat(np.array([0.2, 0.3, 0.4])[:, np.newaxis], par.T, axis=1)
         par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2])[:, np.newaxis], par.T, axis=1)
         par.alpha3 = 1 - par.alpha1 - par.alpha2
@@ -95,6 +95,12 @@ class GM:
         else:
             par.xi_in = np.array([0.04, 0.05, 0.06])
             par.xi_out = np.array([0.03, 0.06, 0.09]).transpose()
+
+        # #Replace default values by those given explicitly to the method
+        for k, v in kwargs.items():
+            setattr(self.par, k, v)
+
+        #Post-setup stuff (e.g. calculating M based on xi-parameters)
         self.c_switching_cost_matrix()
 
         self.diag.tables.skillprice_converge = pd.DataFrame(np.nan, 
@@ -103,9 +109,7 @@ class GM:
                                                             columns=pd.MultiIndex.from_product([["r0", "r1"], range(0, gm.sol.maxiter)], 
                                                                                                names=["Pre/post", "Iteration"]))
 
-        # #Replace default values by those given explicitly to the method
-        # for k, v in kwargs.items():
-        #     setattr(self, k, v)
+
 
     def c_switching_cost_matrix(self):
         """ Takes the xi-parameters and constructs the matrix of switching costs."""
@@ -120,7 +124,7 @@ class GM:
     #     """ grids for experience """
     #     par = self.par
     #     par.grid_exper = np.linspace(par.exper_min, par.exper_max, par.gridpoints_exper)
-
+    #todo: change create to 'c'
     def create_human_capital_unit_prices(self):
         """ Human capital unit prices, the symbol r in the paper. This is just an initial value. This variable is endogenous. """
         par = self.par
@@ -129,9 +133,12 @@ class GM:
         #first dimension: sector. Second dimension: time.
         # par.r = np.random.uniform(1, 10, size=(par.T, par.sectors))
 
-    def load_MASS(self):
+    def load_MASS(self, version="constant"):
         #for testing, this makes the population double halfway through the sample
-        return np.concatenate([np.ones(int(round(self.par.T/2, 0))), np.ones(self.par.T - int(round(self.par.T/2, 0))) + 1])
+        if version == "constant":
+            return np.ones(self.par.T)
+        else:
+            return np.concatenate([np.ones(int(round(self.par.T/2, 0))), np.ones(self.par.T - int(round(self.par.T/2, 0))) + 1])
 
     def load_nominal_output(self):
         return np.repeat((np.ones(self.par.S))[:, np.newaxis], self.par.T, axis=1)
@@ -160,19 +167,40 @@ class GM:
     def precompute_w(self):
         self.sol.w = np.transpose(self.sol.H)[:, :, np.newaxis] * self.par.r[np.newaxis, :, :]
 
+    # #TODO: MAKE THESE TWO CLOSED FORMS NUMERICALLY STABLE USING THE JBE TRICK =)
+    # @staticmethod
+    # def EV_closedform(sigma, arr, axis=0):
+    #     """ Calculate the expected value using the closed form logsum formula from the logit structure """
+    #     return sigma * np.log(np.sum(np.exp(arr / sigma), axis))
+
+    # #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
+    # @staticmethod
+    # def CCP_closedform(sigma, arr, axis=0):
+    #     """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
+    #     if arr.ndim <= 1:
+    #         return np.exp(arr / sigma) / np.sum(np.exp(arr / sigma))
+    #     else:
+    #         return np.divide(np.exp(arr / sigma), np.sum(np.exp(arr / sigma), axis)[:, np.newaxis])
+
     @staticmethod
     def EV_closedform(sigma, arr, axis=0):
-        """ Calculate the expected value using the closed form logsum formula from the logit structure """
-        return sigma * np.log(np.sum(np.exp(arr / sigma), axis))
+        """ Calculate the expected value using the closed form logsum formula from the logit structure. 
+            Numerically stabilized by subtracting a max() value."""
+        if arr.ndim == 1:
+            return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
+        elif arr.ndim == 2:
+            return sigma * (np.max(arr / sigma, axis=axis) + \
+                np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
 
     #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
     @staticmethod
     def CCP_closedform(sigma, arr, axis=0):
         """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
-        if arr.ndim <= 1:
-            return np.exp(arr / sigma) / np.sum(np.exp(arr / sigma))
-        else:
-            return np.divide(np.exp(arr / sigma), np.sum(np.exp(arr / sigma), axis)[:, np.newaxis])
+        if arr.ndim == 1:
+            return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
+        elif arr.ndim == 2:
+            return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
+                            np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
 
     def solve_worker(self):
         """ Solve model by backwards induction for a given set of skill prices. First we solve the last period using static
@@ -280,9 +308,9 @@ class GM:
 
         assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
 
-    def solve_humancap_equilibrium(self, print_out=False):
+    def solve_humancap_equilibrium(self, print_out=True):
         #calculate the skill price consistent with human capital demand equalizing human capital supply.
-        #This presumes that the worker's problem has already been solved once for some value of wages/skill prices.
+        #This presumes that the worker's problem has already been solved once and simulated for some value of wages/skill prices.
         idx = pd.IndexSlice
         df = self.diag.tables.skillprice_converge
 
@@ -306,7 +334,7 @@ class GM:
                 #Make another iteration
                 #Update the skill prices (and wages) then resolve and simulate 
                 self.par.r = r1 * self.sol.step_fraction + self.par.r * (1 - self.sol.step_fraction)
-                self.precompute_w() #H need not be recomputed, it is the same given parameters.
+                self.precompute_w() #H need not be recomputed within this inner loop, since it is the unaltered given some vector of parameters.
                 self.solve_worker()
                 self.simulate()
                 #Proposed skill prices (S x T)
@@ -397,8 +425,8 @@ class GM:
 
     def c_pars_to_estimate(self, set_to_estimate="full"):
         """Generally, c_ stands for 'construct'. """
+        assert set_to_estimate in ["full", "human_capital_function"]
         pars_to_estimate = OrderedDict()
-        set_to_estimate = "full"
         if set_to_estimate == "full":
             varnames = ["beta0", "xi_in", "xi_out", "sigma"] 
         elif set_to_estimate == "human_capital_function":
@@ -409,8 +437,8 @@ class GM:
 
     def c_theta0(self):
         """Constructs a single, 1-dimensional array containing all the parameters to be estimated.
-        Requires self.pars_to_estimate to be defined. I use the name theta0 as 
-        the starting values of the paramters to be estimated. """
+        Requires self.pars_to_estimate to be defined (aliased pte here). I use the name theta0 as 
+        the starting values of the parameters to be estimated. """
         #unpack
         pte = self.est.pars_to_estimate
 
@@ -442,117 +470,190 @@ class GM:
                 setattr(par, key, theta[n : n + s])
             n += s
 
-    def estimate(self):
+    def estimate(self, method="Nelder-Mead"):
         #Prep estimation (assumes est.pars_to_estimate is already defined)
         theta0 = self.est.theta0
+
         pte = self.est.pars_to_estimate
         self.update_par(self.par, theta0, pte)
         self.c_switching_cost_matrix()
 
+        # func = lambda theta: self.obj_func(theta)
+
         print(f'objective function at starting values: {self.obj_func(theta0)}')
 
-        res = optimize.minimize(self.obj_func, theta0)
+        res = optimize.minimize(self.obj_func, theta0, options={"disp":True, "maxiter":1000}, tol=1e-6, method=method)
         return res
 
     def obj_func(self, theta):
+        print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
+        self.precompute() #H changes with parameters and so needs to be precomputed again.
+        self.solve_worker()
+        self.simulate()
         self.solve_humancap_equilibrium()
-        return (2.35 - np.sum(self.sim.density[:, :, 0, 0:5]) + np.sum(theta))**2
+        #data and CCPs 
+        d = self.est.simulated_data
+        c = self.sol.c
+        return - self.loglik(d, c)
 
-    def c_simulated_data(self, n_individuals=1000):
+    def loglik(self, d, c):
+        """Calculate the log likelihood for a sample d with choice probabilities c"""
+        return np.sum(np.log(c[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"]]))
+
+    def c_simulated_data(self, n_individuals=1_000_000):
+        self.rng = default_rng(123456)
         data = pd.DataFrame(-1, 
                             index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
-                            columns=["s", "a", "slag"]).reset_index(level="t") #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+                            columns=["s", "a", "slag"]).reset_index()[["i", "slag", "a", "s", "t"]] #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
 
-        data.loc[data.t == 0, "a"] = 0
-        data.loc[data.t == 0, "slag"] = self.rng.integers(0, self.par.S, n_individuals) #Randomly generate period -1 sector choices (period 0 sector lagged)
+        #Randomly generate starting ages that mean some are younger than 30 in the first period, so they enter model later
+        data.loc[data.t == 0, "a"] = self.rng.integers(self.par.a_min - self.par.T + 1, self.par.a_max + 1, n_individuals)
+        #Update the ages through time deterministically
+        for t in range(1, self.par.T):
+            data.loc[(data.t == t), "a"] = (data.loc[data.t == t - 1, "a"] + 1).to_numpy()
+        #Delete rows where workers are not active in the labor market anymore
+        #For example, this deletes period 0 observations for those that are 29 or younger in that year
+        data = data.loc[((data.a <= self.par.a_max) & (data.a >= self.par.a_min))]
+
+        #Randomly generate period -1 sector choices (period 0 sector lagged)
+        data.loc[data.groupby("i").apply(lambda x: min(x.index)).to_numpy(), "slag"] = self.rng.integers(0, self.par.S, n_individuals)
 
         for t in np.arange(0, self.par.T):
             #Update from previous period if we're not in the first one
             if t > 0:
-                #Transformation function
-                data.loc[(data.t == t), "slag"] = data.loc[(data.t == t - 1), "s"]
-                data.loc[(data.t == t), "a"] = data.loc[(data.t == t - 1), "a"] + 1
-            for a in np.arange(0, self.par.N_ages):
+                #Transformation function (For those that do not enter or exit, add lagged sector from previous choice)
+                data.loc[((data.t == t) & (data.a > self.par.a_min)), "slag"] = data.loc[((data.t == t - 1) & (data.a < self.par.a_max)), "s"].to_numpy()
+            for a in np.arange(self.par.a_min, self.par.a_max + 1):
                 for slag in np.arange(0, self.par.S):
                     size = len(data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"])
+                    #If there are any individuals characterized by this state space point:
                     if size > 0:
                         #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
-                        data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a, :, t])
-            self.est.simulated_data = data
-
-        #data = pd.DataFrame(-1, index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["individual", "year"]), columns=["sector", "age", "s_lag"])
-        #data.loc[idx[:, 0], "age"] = 0
-        #data.loc[idx[:, 0], "s_lag"] = self.rng.integers(0, self.par.S, n_individuals) #Randomly generate period -1 sector choices (period 0 sector lagged)
-        
-#%% Testing
-
-
+                        data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = \
+                            self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a - self.par.a_min, :, t])
+        self.est.simulated_data = data.reset_index(drop=True)
 
 # %% Run
 
 gm = GM()
+# gm.setup(beta0=np.array([-0.1, -0.4, 0.8]))
 gm.setup()
 gm.create_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
+
+#TODO: MAKE THESE TWO CLOSED FORMS NUMERICALLY STABLE USING THE JBE TRICK =)
+
+def EV_closedform(sigma, arr, axis=0):
+    """ Calculate the expected value using the closed form logsum formula from the logit structure. 
+        Numerically stabilized by subtracting a max() value."""
+    if arr.ndim == 1:
+        return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
+    elif arr.ndim == 2:
+        return sigma * (np.max(arr / sigma, axis=axis) + \
+               np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
+
+#måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
+def CCP_closedform(sigma, arr, axis=0):
+    """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
+    if arr.ndim == 1:
+        return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
+    elif arr.ndim == 2:
+        return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
+                         np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
+
+self = gm
+
+self.sol.v
+
+a = 34
+t=6
+slag = 0
+sigma = 1
+arr = V_alternatives
+axis = 1
+np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
+
+arr = self.sol.w[a, :, t] - self.par.SC[slag, :] + self.par.rho * self.sol.v[:, a + 1, t]
+
+arr = V_alternatives
+
+EV_closedform(1, V_alternatives, axis=1)
+
+gm.EV_closedform(gm.par.sigma, V_alternatives, axis=1)
+
+gm.sol.v[slag, a, t]
+
+axis = 1
+sigma * (np.max(arr / sigma, axis=axis) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
+
+v[slag, a, t] = self.EV_closedform(par.sigma, V_alternatives)
+c[slag, a, :, t] = self.CCP_closedform(par.sigma, V_alternatives)
+
+V_alternatives =  self.sol.w[0:self.par.N_ages - 1, :, t] - self.par.SC[slag, :] + self.par.rho*self.sol.v[:, 1:, t + 1].transpose()
+v[slag, 0:-1, t] = 
+self.EV_closedform(self.par.sigma, V_alternatives, axis=1)
+# c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
+
+#%%
 gm.simulate()
 gm.solve_humancap_equilibrium()
-gm.c_pars_to_estimate()
+gm.c_simulated_data()
+gm.c_pars_to_estimate("human_capital_function")
 gm.c_theta0()
 #%%
-#res = gm.estimate()
-self = gm
-n_individuals=100
-self.rng = default_rng(123456)
-data = pd.DataFrame(-1, 
-                    index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
-                    columns=["s", "a", "slag"]).reset_index() #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
 
+gm.est.pars_to_estimate
 
-# data = pd.DataFrame(-1, 
-#                     index=range(0, n_individuals), 
-#                     columns=["t", "s", "a", "slag"]) #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+#Lav descriptives (employment shares?) på simuleret data så jeg kan tjekke at det reagerer når jeg ændrer parametre. 
+#Der sker ligesom ikke noget når jeg estimerer. Den ændrer ikke parametre. Den tror den er done...
 
-#Randomly generate starting ages
-data.loc[data.t == 0, "a"] = self.rng.integers(self.par.a_min - self.par.T + 1, self.par.a_max + 1, n_individuals)
-#Update the ages through time deterministically
-for t in range(1, self.par.T):
-    data.loc[(data.t == t), "a"] = (data.loc[data.t == t - 1, "a"] + 1).values
-#Delete rows where workers are not active in the labor market anymore
-data = data.loc[((data.a <= self.par.a_max) & (data.a >= self.par.a_min))]
-
-# data[data.i == 5]
-
-#Randomly generate period -1 sector choices (period 0 sector lagged)
-data.loc[data.groupby("i").apply(lambda x: min(x.index)).values, "slag"] = self.rng.integers(0, self.par.S, n_individuals)
-
-# t = 1
-for t in np.arange(0, self.par.T):
-    #Update from previous period if we're not in the first one
-    if t > 0:
-        #Transformation function (For those that do not enter or exit, add lagged sector from previous choice)
-        data.loc[((data.t == t) & (data.a > self.par.a_min)), "slag"] = data.loc[((data.t == t - 1) & (data.a < self.par.a_max)), "s"].values #Her skal vi kun vælge dem som rent faktisk valgte noget i forrige periode
-        # data.loc[(data.t == t), "a"] = data.loc[(data.t == t - 1), "a"] + 1
-    for a in np.arange(self.par.a_min, self.par.a_max + 1):
-        for slag in np.arange(0, self.par.S):
-            size = len(data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"])
-            #If there are any individuals characterized by this state space point:
-            if size > 0:
-                #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
-                data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a - self.par.a_min, :, t])
-    self.est.simulated_data = data
 
 #%%
+
+#Make the initial values different from the true ones before testing estimation
+gm.est.theta0 = gm.est.theta0 * np.array([0.9, 1.1, 1.05])
+
+#%%
+res = gm.estimate(method="BFGS")
+
+
+
+gm.par.beta0
+
+np.mean(gm.sol.c[0, :, 0, :], axis=1)
+
+
+#fuck it up
+gm.par.beta0 = np.array([-0.1, -0.4, 0.8])
+gm.precompute()
+
+gm.sol.H
+
+gm.solve_worker()
+
+gm.sol.c
+gm.sol.v.min()
+
+
+gm.sol.c
+
+gm.sol.c
+
+gm.sol.c[:, 35, :, -1]
 
 #todo: bounds på estimation?
 
 
-#%%
+#%% Estimation testing
 
-# gm.update_par(gm.par, theta, gm.est.pars_to_estimate)
+res = gm.estimate()
+res
 
+gm.par.beta0
+gm.est.theta0
 
 #%% Figur
 
