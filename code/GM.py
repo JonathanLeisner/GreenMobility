@@ -13,8 +13,8 @@ from numpy.random import default_rng
 
 np.set_printoptions(precision=3)
 sns.set_theme()
-# import warnings
-# warnings.filterwarnings("error")
+import warnings
+warnings.filterwarnings("error", category=RuntimeWarning)
 
 #%%
 
@@ -63,8 +63,8 @@ class GM:
         #Meta-settings
         sol = self.sol
         sol.step_fraction = 0.05
-        sol.maxiter = 500
-        sol.tolerance_r = 1e-6
+        sol.maxiter = 50000
+        sol.tolerance_r = 1e-10
 
         #Not used
         # par.exper_min = 1e-6 # minimum point in grid for experience
@@ -120,11 +120,12 @@ class GM:
         np.fill_diagonal(par.SC, 0) #Not switching sector is costless
         par.SC = np.exp(par.SC) #todo: becomes non-zero here
 
-    # def create_grids(self):
-    #     """ grids for experience """
-    #     par = self.par
-    #     par.grid_exper = np.linspace(par.exper_min, par.exper_max, par.gridpoints_exper)
-    #todo: change create to 'c'
+        # def create_grids(self):
+        #     """ grids for experience """
+        #     par = self.par
+        #     par.grid_exper = np.linspace(par.exper_min, par.exper_max, par.gridpoints_exper)
+        #todo: change create to 'c'
+
     def create_human_capital_unit_prices(self):
         """ Human capital unit prices, the symbol r in the paper. This is just an initial value. This variable is endogenous. """
         par = self.par
@@ -200,7 +201,7 @@ class GM:
             return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
         elif arr.ndim == 2:
             return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
-                            np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
+                             np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
 
     def solve_worker(self):
         """ Solve model by backwards induction for a given set of skill prices. First we solve the last period using static
@@ -464,6 +465,7 @@ class GM:
     def update_par(par, theta, pars_to_estimate):
         n = 0
         for key, s in pars_to_estimate.items():
+            #s for size
             if s == 1:
                 setattr(par, key, theta[n])
             elif s > 1:
@@ -482,10 +484,11 @@ class GM:
 
         print(f'objective function at starting values: {self.obj_func(theta0)}')
 
-        res = optimize.minimize(self.obj_func, theta0, options={"disp":True, "maxiter":1000}, tol=1e-6, method=method)
+        res = optimize.minimize(self.obj_func, theta0, options={"disp":True, "maxiter":1000, "eps":0.01}, tol=1e-6, method=method)
         return res
 
     def obj_func(self, theta):
+        """ Update parameters, calculate equilibrium and evaluate loglik"""
         print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
         self.precompute() #H changes with parameters and so needs to be precomputed again.
@@ -501,7 +504,8 @@ class GM:
         """Calculate the log likelihood for a sample d with choice probabilities c"""
         return np.sum(np.log(c[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"]]))
 
-    def c_simulated_data(self, n_individuals=1_000_000):
+    def c_simulated_data(self, n_individuals=100_000):
+        """Simulate data from the model currently stored. We simulate a number of individuals."""
         self.rng = default_rng(123456)
         data = pd.DataFrame(-1, 
                             index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
@@ -544,58 +548,6 @@ gm.allocate()
 gm.precompute()
 gm.solve_worker()
 
-#TODO: MAKE THESE TWO CLOSED FORMS NUMERICALLY STABLE USING THE JBE TRICK =)
-
-def EV_closedform(sigma, arr, axis=0):
-    """ Calculate the expected value using the closed form logsum formula from the logit structure. 
-        Numerically stabilized by subtracting a max() value."""
-    if arr.ndim == 1:
-        return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
-    elif arr.ndim == 2:
-        return sigma * (np.max(arr / sigma, axis=axis) + \
-               np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
-
-#måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
-def CCP_closedform(sigma, arr, axis=0):
-    """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
-    if arr.ndim == 1:
-        return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
-    elif arr.ndim == 2:
-        return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
-                         np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
-
-self = gm
-
-self.sol.v
-
-a = 34
-t=6
-slag = 0
-sigma = 1
-arr = V_alternatives
-axis = 1
-np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
-
-arr = self.sol.w[a, :, t] - self.par.SC[slag, :] + self.par.rho * self.sol.v[:, a + 1, t]
-
-arr = V_alternatives
-
-EV_closedform(1, V_alternatives, axis=1)
-
-gm.EV_closedform(gm.par.sigma, V_alternatives, axis=1)
-
-gm.sol.v[slag, a, t]
-
-axis = 1
-sigma * (np.max(arr / sigma, axis=axis) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
-
-v[slag, a, t] = self.EV_closedform(par.sigma, V_alternatives)
-c[slag, a, :, t] = self.CCP_closedform(par.sigma, V_alternatives)
-
-V_alternatives =  self.sol.w[0:self.par.N_ages - 1, :, t] - self.par.SC[slag, :] + self.par.rho*self.sol.v[:, 1:, t + 1].transpose()
-v[slag, 0:-1, t] = 
-self.EV_closedform(self.par.sigma, V_alternatives, axis=1)
-# c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
 
 #%%
 gm.simulate()
@@ -608,7 +560,6 @@ gm.c_theta0()
 gm.est.pars_to_estimate
 
 #Lav descriptives (employment shares?) på simuleret data så jeg kan tjekke at det reagerer når jeg ændrer parametre. 
-#Der sker ligesom ikke noget når jeg estimerer. Den ændrer ikke parametre. Den tror den er done...
 
 
 #%%
@@ -619,11 +570,7 @@ gm.est.theta0 = gm.est.theta0 * np.array([0.9, 1.1, 1.05])
 #%%
 res = gm.estimate(method="BFGS")
 
-
-
-gm.par.beta0
-
-np.mean(gm.sol.c[0, :, 0, :], axis=1)
+#%%
 
 
 #fuck it up
