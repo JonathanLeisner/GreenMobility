@@ -18,7 +18,9 @@ warnings.filterwarnings("error", category=RuntimeWarning)
 
 #%%
 
+arr = np.array([1, 2, 3])[:2][:, np.newaxis]
 
+arr 
 
 
 #%%
@@ -29,6 +31,7 @@ class GM:
     def __init__(self, name = None):
         self.sol = SimpleNamespace()
         self.par = SimpleNamespace()
+        self.par.scale = SimpleNamespace() #collects scalar scales for all parameters.
         self.sim = SimpleNamespace()
         self.est = SimpleNamespace()
         self.results = SimpleNamespace()
@@ -46,30 +49,40 @@ class GM:
         self.version = "v3"
         self.rng = default_rng(123456) #seed
 
-    def setup(self, **kwargs):
-        """ Initiates parameter values at their default values"""
-        
-        par = self.par
+        self.est.default_method = "Nelder-Mead"
 
-        #Fundamentals    
-        par.T = 8 #periods
+    def setup_statespace(self, simple_statespace):
+        #Unpack
+        par = self.par
+        #State space definitions
+        if simple_statespace:        
+            par.T = 4 #periods
+            par.a_max = 40 #eldest cohort
+        else:
+            par.T = 8
+            par.a_max = 65
+        
+        #Sectors
         par.sector_names = ["Unemployment", "Clean", "Dirty"]
         par.S = len(par.sector_names)
-        par.a_max = 65 #eldest cohort
+
+        #Age
         par.a_min = 30 #youngest cohort
         par.ages = np.arange(par.a_min, par.a_max + 1)
         par.N_ages = par.a_max + 1 - par.a_min
+
+    def setup(self, simple_statespace=False, **kwargs):
+        """ Initiates parameter values at their default values"""
+        
+        par = self.par
+        self.setup_statespace(simple_statespace)
+
         
         #Meta-settings
         sol = self.sol
         sol.step_fraction = 0.05
         sol.maxiter = 50000
         sol.tolerance_r = 1e-10
-
-        #Not used
-        # par.exper_min = 1e-6 # minimum point in grid for experience
-        # par.exper_max = 20.0 # maximum point in grid for experience
-        # par.gridpoints_exper = 200 #number of gridpoints for experience
 
         #Fixed quantities from data
         par.MASS = self.load_MASS()
@@ -80,21 +93,23 @@ class GM:
         par.sigma = 0.8
 
         #Should be loaded from data later
-        par.alpha1 = np.repeat(np.array([0.2, 0.3, 0.4])[:, np.newaxis], par.T, axis=1)
-        par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2])[:, np.newaxis], par.T, axis=1)
+        par.alpha1 = np.repeat(np.array([0.2, 0.2, 0.3, 0.1])[:par.S][:, np.newaxis], par.T, axis=1)
+        par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2, 0.1])[:par.S][:, np.newaxis], par.T, axis=1)
         par.alpha3 = 1 - par.alpha1 - par.alpha2
 
         #Parameters to estimate later
         #Human capital function parameters
-        par.beta0 = np.array([0.002, 0.006, 0.012]) #1-dimensional over sectors. 
+        #par.beta0 = np.array([0.002, 0.006, 0.012, 0.008])[:par.S] #1-dimensional over sectors. 
+        par.beta0 = np.array([0.2, 0.6, 1.2, 0.8])[:par.S] #1-dimensional over sectors. 
+        par.scale.beta0 = 100 #Meaning true parameters are x times smaller than the values in the code
 
         #Switching costs (direct utility costs)
         if self.name == "high_switchingcost":
-            par.xi_in = 20 * np.array([0.04, 0.05, 0.06])
-            par.xi_out = 20 * np.array([0.03, 0.06, 0.09]).transpose()    
+            par.xi_in = 20 * np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
+            par.xi_out = 20 * np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()    
         else:
-            par.xi_in = np.array([0.04, 0.05, 0.06])
-            par.xi_out = np.array([0.03, 0.06, 0.09]).transpose()
+            par.xi_in = np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
+            par.xi_out = np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
 
         # #Replace default values by those given explicitly to the method
         for k, v in kwargs.items():
@@ -115,10 +130,10 @@ class GM:
         """ Takes the xi-parameters and constructs the matrix of switching costs."""
         par = self.par
 
-        #Switching cost (SC) has dimensions (s_{t-1} x s_{t}) i.e. (s_out x s_in)
-        par.SC = sum(np.meshgrid(par.xi_in, par.xi_out)) #add cost of going OUT of a sector with the cost of going IN to a sector.
-        np.fill_diagonal(par.SC, 0) #Not switching sector is costless
-        par.SC = np.exp(par.SC) #todo: becomes non-zero here
+        #Switching cost (M) has dimensions (s_{t-1} x s_{t}) i.e. (s_out x s_in)
+        par.M = sum(np.meshgrid(par.xi_in, par.xi_out)) #add cost of going OUT of a sector with the cost of going IN to a sector.
+        par.M = np.exp(par.M)
+        np.fill_diagonal(par.M, 0) #Not switching sector is costless
 
         # def create_grids(self):
         #     """ grids for experience """
@@ -126,8 +141,9 @@ class GM:
         #     par.grid_exper = np.linspace(par.exper_min, par.exper_max, par.gridpoints_exper)
         #todo: change create to 'c'
 
-    def create_human_capital_unit_prices(self):
-        """ Human capital unit prices, the symbol r in the paper. This is just an initial value. This variable is endogenous. """
+    def c_human_capital_unit_prices(self):
+        """ Human capital unit prices, the symbol r in the paper. This is just an initial value. 
+            This variable is endogenously determined in equilibrium. """
         par = self.par
         # SxT
         par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=1)
@@ -163,25 +179,10 @@ class GM:
 
 
     def precompute_H(self):
-        self.sol.H = np.exp(self.par.beta0[:, np.newaxis] * self.par.ages)
+        self.sol.H = np.exp(self.par.beta0[:, np.newaxis]/self.par.scale.beta0 * self.par.ages)
 
     def precompute_w(self):
         self.sol.w = np.transpose(self.sol.H)[:, :, np.newaxis] * self.par.r[np.newaxis, :, :]
-
-    # #TODO: MAKE THESE TWO CLOSED FORMS NUMERICALLY STABLE USING THE JBE TRICK =)
-    # @staticmethod
-    # def EV_closedform(sigma, arr, axis=0):
-    #     """ Calculate the expected value using the closed form logsum formula from the logit structure """
-    #     return sigma * np.log(np.sum(np.exp(arr / sigma), axis))
-
-    # #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
-    # @staticmethod
-    # def CCP_closedform(sigma, arr, axis=0):
-    #     """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
-    #     if arr.ndim <= 1:
-    #         return np.exp(arr / sigma) / np.sum(np.exp(arr / sigma))
-    #     else:
-    #         return np.divide(np.exp(arr / sigma), np.sum(np.exp(arr / sigma), axis)[:, np.newaxis])
 
     @staticmethod
     def EV_closedform(sigma, arr, axis=0):
@@ -212,7 +213,7 @@ class GM:
 
         #Unpack solution objects
         w = sol.w #offered wages.
-        SC = par.SC #utility switching cost
+        M = par.M #utility switching cost
         c = sol.c #conditional choice probabilities
         v = sol.v #expected value functions
 
@@ -224,14 +225,14 @@ class GM:
         #Loop over different lagged sectors (slag)
 
         for slag in np.arange(0, par.S):
-            v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - SC[slag, :])
-            c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - SC[slag, :])
+            v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - M[slag, :])
+            c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - M[slag, :])
 
         #Then iterate from age 64 to 30.
         # a = 34
         for a in reversed(np.arange(par.N_ages - 1)):
             for slag in np.arange(0, par.S):
-                V_alternatives = w[a, :, t] - SC[slag, :] + par.rho * v[:, a + 1, t]
+                V_alternatives = w[a, :, t] - M[slag, :] + par.rho * v[:, a + 1, t]
                 #Nemt her stadig pga. simpel transformation function.
                 #når valget i dag påvirker min state i morgen kommer det ind her.
                 #Version 3: da mit valg i dag bare er det samme som min state i morgen kan jeg bare tilføje
@@ -246,13 +247,13 @@ class GM:
             #Calculate the value function when age = 65, which has no continuation value
             a = par.N_ages - 1
             for slag in np.arange(0, par.S):
-                v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - SC[slag, :])
-                c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - SC[slag, :])
+                v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - M[slag, :])
+                c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - M[slag, :])
 
             #Calculate the value functions for ages 64 - 30
             #H[:, 0:par.N_ages - 1] * r[:, t][:, np.newaxis] bruger mindre memory men kan ikke precomputes. Hvad er bedst?
-            #Løn +SC på tværs af valget. Samme dimension er i continuation value. løn i sek 0 skal plusses med cont når jeg kommer fra sek 0.
-                V_alternatives =  w[0:par.N_ages - 1, :, t] - SC[slag, :] + par.rho*v[:, 1:, t + 1].transpose()
+            #Løn +M på tværs af valget. Samme dimension er i continuation value. løn i sek 0 skal plusses med cont når jeg kommer fra sek 0.
+                V_alternatives =  w[0:par.N_ages - 1, :, t] - M[slag, :] + par.rho*v[:, 1:, t + 1].transpose()
                 v[slag, 0:-1, t] = self.EV_closedform(par.sigma, V_alternatives, axis=1)
                 c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
 
@@ -424,53 +425,95 @@ class GM:
         probs = np.mean(np.sum(d[:, :, :, 1:], axis=1) / np.sum(d[:, :, :, 1:], axis=(1, 2))[:, np.newaxis, :], axis=2)
         self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=gm.par.sector_names, columns=gm.par.sector_names)
 
-    def c_pars_to_estimate(self, set_to_estimate="full"):
-        """Generally, c_ stands for 'construct'. """
-        assert set_to_estimate in ["full", "human_capital_function"]
+    def c_pars_to_estimate(self, parameters=None, indexes=None):
+        """ Generally, c_ stands for 'construct'. Constructs an ordered dictionary where keys are parameter names
+            and each value is an array of indexes. This indexes the parameter itself in self.par. 
+            These two are controlled using the optional arguments 'parameters' and 'indexes'."""
         pars_to_estimate = OrderedDict()
-        if set_to_estimate == "full":
-            varnames = ["beta0", "xi_in", "xi_out", "sigma"] 
-        elif set_to_estimate == "human_capital_function":
-            varnames = ["beta0"]
-        for var in varnames:
-            pars_to_estimate[var] = self.find_len_of_parameter(getattr(gm.par, var))
+
+        #default values
+        if parameters is None:
+            parameters = ["beta0"]
+        if indexes is None:
+            indexes = [None] * len(parameters)
+
+        if isinstance(indexes, np.ndarray):
+            #if only an array is given in 'indexes' it must refer to the index of only one parameter to be estimated
+            assert len(parameters) == 1 
+            pars_to_estimate[parameters[0]] = indexes
+        else:
+            for i, par in enumerate(parameters):
+                if indexes[i] is None:
+                    pars_to_estimate[par] = c_index_array(getattr(self.par, par)) #SELF again
+                else:
+                    assert isinstance(indexes[i], np.ndarray)
+                    pars_to_estimate[par] = indexes[i]
         self.est.pars_to_estimate = pars_to_estimate
 
     def c_theta0(self):
-        """Constructs a single, 1-dimensional array containing all the parameters to be estimated.
-        Requires self.pars_to_estimate to be defined (aliased pte here). I use the name theta0 as 
-        the starting values of the parameters to be estimated. """
-        #unpack
+        """ Constructs a single, 1-dimensional array containing all the parameters to be estimated.
+            Requires self.pars_to_estimate to be defined (aliased pte here). I use the name theta0 as 
+            the starting values of the parameters to be estimated. """
         pte = self.est.pars_to_estimate
+        #Initialize theta0 with the correct length.
+        theta0 = np.zeros(np.sum([len(pte[k]) if pte[k] is not None else 1 for k in pte]))
+        n = 0 #counter for index in theta0 itself
 
-        theta0 = np.zeros(sum(pte.values()))
-        n = 0
-        for key, s in pte.items():
-            #s for size (length of array)
-            if s == 1:
-                theta0[n] = getattr(self.par, key)
-            elif s > 1:
-                theta0[n : n + s] = getattr(self.par, key)
-            n += s
+        for par, index in pte.items():
+            if index is None:
+                theta0[n] = getattr(self.par, par)
+                n += 1
+            else:
+                theta0[n : n + len(index)] = getattr(self.par, par)[index]
+                n += len(index)
         self.est.theta0 = theta0
 
     @staticmethod
-    def find_len_of_parameter(parameter):
+    def c_index_array(parameter):
         if isinstance(parameter, np.ndarray):
-            return parameter.size
+            return np.arange(parameter.size)
         elif isinstance(parameter, (float, int)):
-            return 1
+            return None
+        else:
+            raise Exception("Parameter must be array or scalar")
 
     @staticmethod
     def update_par(par, theta, pars_to_estimate):
         n = 0
-        for key, s in pars_to_estimate.items():
-            #s for size
-            if s == 1:
-                setattr(par, key, theta[n])
-            elif s > 1:
-                setattr(par, key, theta[n : n + s])
-            n += s
+        for key, index in pars_to_estimate.items():
+            if index is not None:
+                #array parameter
+                vals = getattr(par, key) #previous value is retrieved
+                vals[pars_to_estimate[key]] = theta[n : n + len(index)] #update
+                setattr(par, key, vals) #new value is set
+                n += len(index)
+            else:
+                #scalar parameter
+                setattr(par, key, theta[n]) #new value is set
+                n += 1
+
+    def setup_estimation(self, partial=False, method=None):
+        if method is None:
+            method = self.est.default_method
+        self.c_est_options(method)
+        #Fix skill prices arbitrarily, or by equilibrium conditions
+        if partial:
+            self.est.partial = True
+        else:
+            self.est.partial = False
+
+    def c_est_options(self, method):
+        options = {"disp":True, "maxiter":1000}
+        if method == "BFGS":
+            options["gtol"] = 1e-10
+        self.est.options = options
+
+    @staticmethod
+    def est_ftol(method):
+        if method == "Nelder-Mead":
+            return 1e-10
+        else:
+            return 1e-10
 
     def estimate(self, method="Nelder-Mead"):
         #Prep estimation (assumes est.pars_to_estimate is already defined)
@@ -480,25 +523,26 @@ class GM:
         self.update_par(self.par, theta0, pte)
         self.c_switching_cost_matrix()
 
-        # func = lambda theta: self.obj_func(theta)
-
         print(f'objective function at starting values: {self.obj_func(theta0)}')
 
-        res = optimize.minimize(self.obj_func, theta0, options={"disp":True, "maxiter":1000, "eps":0.01}, tol=1e-6, method=method)
+        res = optimize.minimize(self.obj_func, theta0, options=self.est.options, tol=self.est_ftol(method), method=method)
         return res
 
     def obj_func(self, theta):
-        """ Update parameters, calculate equilibrium and evaluate loglik"""
+        """ Update parameters, calculate equilibrium and evaluate loglik. If partial = True, 
+            the skill prices (r) are kept fixed, and hence the human capital equilibrium conditions 
+            are ignored. """
         print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
         self.precompute() #H changes with parameters and so needs to be precomputed again.
         self.solve_worker()
-        self.simulate()
-        self.solve_humancap_equilibrium()
+        if not self.est.partial:
+            self.solve_humancap_equilibrium()
+            self.simulate()
         #data and CCPs 
         d = self.est.simulated_data
         c = self.sol.c
-        return - self.loglik(d, c)
+        return - self.loglik(d, c) / len(d) #Normalize by number of observations
 
     def loglik(self, d, c):
         """Calculate the log likelihood for a sample d with choice probabilities c"""
@@ -538,12 +582,42 @@ class GM:
                             self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a - self.par.a_min, :, t])
         self.est.simulated_data = data.reset_index(drop=True)
 
+    def plot_ll_3d(self, x_values, y_values):
+        """ Plot the loglikelihood as a function of two parameters."""
+        n_params = 0
+        for _, index in self.est.pars_to_estimate.items():
+            if index is None:
+                n_params += 1
+            else:
+                n_params += len(index)
+            assert n_params == 2, "Exactly 2 parameters must be chosen for plotting."
+
+        z = np.zeros((len(x_values)*(len(y_values))))
+
+        n = 0
+        for xval in x_values:
+            for yval in y_values:
+                z[n] = self.obj_func(theta = np.array([xval, yval]))
+                n += 1
+
+        X, Y = np.meshgrid(x_values, y_values)
+        Z = z.reshape(X.shape)
+
+        fig = plt.figure()
+
+        # syntax for 3-D projection
+        from mpl_toolkits import mplot3d
+        ax = plt.axes(projection="3d")
+        ax.plot_surface(X, Y, Z, cmap ='viridis', edgecolor ='green')
+        return fig
+
 # %% Run
 
 gm = GM()
 # gm.setup(beta0=np.array([-0.1, -0.4, 0.8]))
-gm.setup()
-gm.create_human_capital_unit_prices()
+gm.setup(simple_statespace=False)
+
+gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
@@ -553,54 +627,28 @@ gm.solve_worker()
 gm.simulate()
 gm.solve_humancap_equilibrium()
 gm.c_simulated_data()
-gm.c_pars_to_estimate("human_capital_function")
+gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([0, 2]))
 gm.c_theta0()
+
 #%%
 
-gm.est.pars_to_estimate
+gm.est.theta0
+gm.setup_estimation(partial=True)
+fig = gm.plot_ll_3d(x_values = np.linspace(0.1, 0.3, 50), y_values = np.linspace(0.2, 1.3, 50))
 
-#Lav descriptives (employment shares?) på simuleret data så jeg kan tjekke at det reagerer når jeg ændrer parametre. 
-
+gm.savefig(fig, "loglik_3d")
 
 #%%
 
 #Make the initial values different from the true ones before testing estimation
-gm.est.theta0 = gm.est.theta0 * np.array([0.9, 1.1, 1.05])
+gm.est.theta0 = gm.est.theta0 * np.array([0.5, 1.3, 1.5])
 
 #%%
-res = gm.estimate(method="BFGS")
+method = "BFGS"
+gm.setup_estimation(method)
+gm.est.options["gtol"] = 1e-7
 
-#%%
-
-
-#fuck it up
-gm.par.beta0 = np.array([-0.1, -0.4, 0.8])
-gm.precompute()
-
-gm.sol.H
-
-gm.solve_worker()
-
-gm.sol.c
-gm.sol.v.min()
-
-
-gm.sol.c
-
-gm.sol.c
-
-gm.sol.c[:, 35, :, -1]
-
-#todo: bounds på estimation?
-
-
-#%% Estimation testing
-
-res = gm.estimate()
-res
-
-gm.par.beta0
-gm.est.theta0
+res = gm.estimate(partial=True, method=method)
 
 #%% Figur
 
@@ -618,7 +666,7 @@ gm.fig_employment_shares(save=True)
 
 gm = GM()
 gm.setup()
-gm.create_human_capital_unit_prices()
+gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve()
@@ -638,7 +686,7 @@ gm.fig_employment_shares()
 
 gm = GM(name="Higher dirty wage")
 gm.setup()
-gm.create_human_capital_unit_prices()
+gm.c_human_capital_unit_prices()
 
 #Add some more wage to the dirty sector
 gm.par.r[-1, :] += 1
