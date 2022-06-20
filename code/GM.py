@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import optimize
 from numpy.random import default_rng
-
+from mpl_toolkits import mplot3d
 
 np.set_printoptions(precision=3)
 sns.set_theme()
@@ -17,10 +17,6 @@ import warnings
 warnings.filterwarnings("error", category=RuntimeWarning)
 
 #%%
-
-arr = np.array([1, 2, 3])[:2][:, np.newaxis]
-
-arr 
 
 
 #%%
@@ -606,10 +602,10 @@ class GM:
         fig = plt.figure()
 
         # syntax for 3-D projection
-        from mpl_toolkits import mplot3d
+        
         ax = plt.axes(projection="3d")
         ax.plot_surface(X, Y, Z, cmap ='viridis', edgecolor ='green')
-        return fig
+        return (fig, ax)
 
 # %% Run
 
@@ -632,11 +628,21 @@ gm.c_theta0()
 
 #%%
 
-gm.est.theta0
 gm.setup_estimation(partial=True)
-fig = gm.plot_ll_3d(x_values = np.linspace(0.1, 0.3, 50), y_values = np.linspace(0.2, 1.3, 50))
+fig, ax = gm.plot_ll_3d(x_values = np.linspace(0.1, 0.3, 25), y_values = np.linspace(1.3, 1.1, 25))
 
-gm.savefig(fig, "loglik_3d")
+ax.set_ylim([max(ax.get_ylim()), min(ax.get_ylim())])
+
+fig
+
+
+#%%
+ax
+ax.view_init(45, 75)
+
+fig
+
+gm.savefig(fig, "loglik_3d_2")
 
 #%%
 
