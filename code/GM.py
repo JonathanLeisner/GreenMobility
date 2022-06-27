@@ -45,7 +45,7 @@ class GM:
         self.version = "v3"
         self.rng = default_rng(123456) #seed
 
-        self.est.default_method = "Nelder-Mead"
+        self.est.default_method = "BFGS"
 
     def setup_statespace(self, simple_statespace):
         """ This function defines the attributes related to the state space. It allows setting 'simple_statespace'
@@ -157,12 +157,12 @@ class GM:
 
     def allocate(self):
         """ Allocate empty containers for solution objects. 
-        c contains the CCPs and v contains expected value functions"""
+        P contains the CCPs and EV contains expected value functions"""
         sol = self.sol
         par = self.par
 
-        sol.c = np.zeros((par.S, par.N_ages, par.S, par.T)) - 1 #4 dimensions: slag, a, s (choice), t
-        sol.v = np.zeros((par.S, par.N_ages, par.T)) - 99 #3 dimensions: slag, a, t
+        sol.P = np.zeros((par.S, par.N_ages, par.S, par.T)) - 1 #4 dimensions: slag, a, s (choice), t
+        sol.EV = np.zeros((par.S, par.N_ages, par.T)) - 99 #3 dimensions: slag, a, t
 
     def precompute(self):
         """ Calculates the wages offered in each sector at each point in the state space. 
@@ -181,25 +181,40 @@ class GM:
         """ Calculate all possible values of wages. w = r*H"""
         self.sol.w = np.transpose(self.sol.H)[:, :, np.newaxis] * self.par.r[np.newaxis, :, :]
 
-    @staticmethod
-    def EV_closedform(sigma, arr, axis=0):
-        """ Calculate the expected value using the closed form logsum formula from the logit structure. 
-            Numerically stabilized by subtracting a max() value."""
-        if arr.ndim == 1:
-            return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
-        elif arr.ndim == 2:
-            return sigma * (np.max(arr / sigma, axis=axis) + \
-                np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
+    # @staticmethod
+    # def EV_closedform(sigma, arr, axis=0):
+    #     """ Calculate the expected value using the closed form logsum formula from the logit structure. 
+    #         Numerically stabilized by subtracting a max() value."""
+    #     if arr.ndim == 1:
+    #         return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
+    #     elif arr.ndim == 2:
+    #         return sigma * (np.max(arr / sigma, axis=axis) + \
+    #             np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
 
-    #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
+    # #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
+    # @staticmethod
+    # def CCP_closedform(sigma, arr, axis=0):
+    #     """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
+    #     if arr.ndim == 1:
+    #         return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
+    #     elif arr.ndim == 2:
+    #         return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
+    #                          np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
+
     @staticmethod
-    def CCP_closedform(sigma, arr, axis=0):
-        """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
+    def closed_forms(sigma, arr):
+        """Calculate the closed-form solutions for EV and CCP. """
         if arr.ndim == 1:
-            return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
-        elif arr.ndim == 2:
-            return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
-                             np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
+            constant = np.max(arr / sigma)
+            sumexp = np.sum(np.exp(arr / sigma - constant))
+            EV = sigma * (constant + np.log(sumexp))
+            P = np.exp(arr / sigma - constant) / sumexp
+        if arr.ndim == 2:
+            constant = np.max(arr / sigma, axis=1) #max for a given state space point, across choices. This becomes last axis when I move choice.
+            sumexp = np.sum(np.exp(arr / sigma - constant[:, np.newaxis]), axis=1) #sumexp is used in both formulas, so we only calculate it once.
+            EV = sigma * (constant + np.log(sumexp))
+            P = np.exp(arr / sigma - constant[:, np.newaxis]) / sumexp[:, np.newaxis]
+        return (EV, P)
 
     def solve_worker(self):
         """ Solve the worker's problem by backwards induction for a given set of skill prices (r). 
@@ -211,8 +226,8 @@ class GM:
         #Unpack solution objects
         w = sol.w #offered wages.
         M = par.M #utility switching cost
-        c = sol.c #conditional choice probabilities
-        v = sol.v #expected value functions
+        P = sol.P #conditional choice probabilities
+        EV = sol.EV #expected value functions
 
         #PART I (age iteration within the terminal period, static expectation)
         t = par.T - 1
@@ -220,41 +235,36 @@ class GM:
 
         #Start at the retirement age, where there are no continuation values
         #Loop over different lagged sectors (slag)
-
+        
         for slag in np.arange(0, par.S):
-            v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - M[slag, :])
-            c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - M[slag, :])
+            (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, w[a, :, t] - M[slag, :])
 
         #Then iterate from age 64 to 30.
         # a = 34
+        # slag = 0
         for a in reversed(np.arange(par.N_ages - 1)):
             for slag in np.arange(0, par.S):
-                V_alternatives = w[a, :, t] - M[slag, :] + par.rho * v[:, a + 1, t]
+                V_alternatives = w[a, :, t] - M[slag, :] + par.rho * EV[:, a + 1, t]
                 #Nemt her stadig pga. simpel transformation function.
                 #når valget i dag påvirker min state i morgen kommer det ind her.
                 #Version 3: da mit valg i dag bare er det samme som min state i morgen kan jeg bare tilføje
                 #v[:, ...] og stadig få den korrekte continuation value.
-                v[slag, a, t] = self.EV_closedform(par.sigma, V_alternatives)
-                c[slag, a, :, t] = self.CCP_closedform(par.sigma, V_alternatives)
+                (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, V_alternatives)
 
         #PART II (time iteration from T - 2 to 0.)
         #Iterate from period T-2 (second to last period). Within each period. I don't have to iterate on age yet
-        t = par.T - 2
+        # t = par.T - 2
         for t in reversed(np.arange(par.T - 1)):
             #Calculate the value function when age = 65, which has no continuation value
             a = par.N_ages - 1
             for slag in np.arange(0, par.S):
-                v[slag, a, t] = self.EV_closedform(par.sigma, w[a, :, t] - M[slag, :])
-                c[slag, a, :, t] = self.CCP_closedform(par.sigma, w[a, :, t] - M[slag, :])
+                (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, w[a, :, t] - M[slag, :])
 
             #Calculate the value functions for ages 64 - 30
             #H[:, 0:par.N_ages - 1] * r[:, t][:, np.newaxis] bruger mindre memory men kan ikke precomputes. Hvad er bedst?
             #Løn +M på tværs af valget. Samme dimension er i continuation value. løn i sek 0 skal plusses med cont når jeg kommer fra sek 0.
-                V_alternatives =  w[0:par.N_ages - 1, :, t] - M[slag, :] + par.rho*v[:, 1:, t + 1].transpose()
-                v[slag, 0:-1, t] = self.EV_closedform(par.sigma, V_alternatives, axis=1)
-                c[slag, 0:-1, :, t] = self.CCP_closedform(par.sigma, V_alternatives, axis=1)
-
-
+                V_alternatives =  w[0:par.N_ages - 1, :, t] - M[slag, :] + par.rho * EV[:, 1:, t + 1].transpose()
+                (EV[slag, 0:-1, t], P[slag, 0:-1, :, t]) = closed_forms(par.sigma, V_alternatives)
 
     def simulate(self):
         """ Simulate the model forward for a given set of skill prices. 
@@ -263,7 +273,7 @@ class GM:
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
         use the conditional choice probabilities as "transition" probabilities. """
 
-        c = self.sol.c
+        P = self.sol.P
         par = self.par
 
         #Measure how large a fraction of the people are at each point in the {state space x sector}.
@@ -295,7 +305,7 @@ class GM:
             # np.sum(density[:, -1, :, t - 1]) sums over all parts of the state except age and time. Because we simply need ALL retiring people.
             retiring = np.sum(density[:, -1, :, t - 1])
             ## Entering cohort:
-            density[:, 0, :, t] = retiring * EnteringStateSpaceDist[:, np.newaxis] * c[:, 0, :, t]
+            density[:, 0, :, t] = retiring * EnteringStateSpaceDist[:, np.newaxis] * P[:, 0, :, t]
 
             ## What will people of ages 31-65 do in this period.
             # The transpose moves the sector dimension in front of the age dimension. This is intuitive, since the current sector
@@ -303,7 +313,7 @@ class GM:
             # (s_lag, age, s_curr, time) 
             # We sum over period t-2 sectors (previous period's lagged sector) since they do not matter
             # for current choices.
-            density[:, 1:, :, t] = np.sum(density[:, 0:-1, :, t-1], axis=0).transpose()[:, :, np.newaxis] * c[:, 1:, :, t]
+            density[:, 1:, :, t] = np.sum(density[:, 0:-1, :, t-1], axis=0).transpose()[:, :, np.newaxis] * P[:, 1:, :, t]
 
         assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
 
@@ -544,10 +554,12 @@ class GM:
         else:
             return 1e-10
 
-    def estimate(self, method="Nelder-Mead"):
+    def estimate(self, method=None):
         """ Estimate the parameters stored in self.est.pars_to_estimate. 
             Uses the starting values stored in self.est.theta0. 
         """
+        if method is None:
+            method = self.est.default_method
         #Prep estimation (assumes est.pars_to_estimate is already defined)
         theta0 = self.est.theta0
         pte = self.est.pars_to_estimate
@@ -582,16 +594,16 @@ class GM:
         
         #data and CCPs 
         d = self.est.simulated_data
-        c = self.sol.c
-        ll = self.loglik(d, c)
+        P = self.sol.P
+        ll = self.loglik(d, P)
         if self.est.analytic_gradients:
             return (ll, self.score())
         else:
             return ll
 
-    def loglik(self, d, c):
+    def loglik(self, d, P):
         """Calculate the (negative of the) log likelihood for a sample d with choice probabilities c"""
-        return - np.sum(np.log(c[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"]])) / len(d)
+        return - np.sum(np.log(P[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"]])) / len(d)
 
     def score(self):
         """Calculate the score of the (negative of the) log likelihood. """
@@ -643,7 +655,7 @@ class GM:
                     if size > 0:
                         #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
                         data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = \
-                            self.rng.choice(self.par.S, size=size, p=self.sol.c[slag, a - self.par.a_min, :, t])
+                            self.rng.choice(self.par.S, size=size, p=self.sol.P[slag, a - self.par.a_min, :, t])
         self.est.simulated_data = data.reset_index(drop=True)
 
     def plot_ll_3d(self, x_values, y_values):
@@ -671,13 +683,13 @@ class GM:
         
         #Unpack
         w = self.sol.w
-        c = self.sol.c
+        P = self.sol.P
         pte = self.est.pars_to_estimate
 
         #Containers for results
-        dEV = np.zeros(self.sol.v.shape + (self.est.n_params,))
+        dEV = np.zeros(self.sol.EV.shape + (self.est.n_params,))
         dw = np.zeros(w.shape + (self.est.n_params,))
-        dv = np.zeros(c.shape + (self.est.n_params,))
+        dv = np.zeros(P.shape + (self.est.n_params,)) #derivatives of choice-specific value functions
 
         if parameter == "beta0":
 
@@ -695,9 +707,7 @@ class GM:
             #Next, the last age, dEV
             #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
             #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-            dEV[:, a, :, :] = np.sum(c[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=1)
-
-            #ER SIGMA MED KORREKT RUNDT OMKRING? / SKRIV DET I OVERLEAF!
+            dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=1)
 
             # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
             # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
@@ -706,7 +716,7 @@ class GM:
                 a -= 1
                 dv[:, a, :, self.par.T - 1, :] = (dw[a, :, self.par.T - 1, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
                 #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-                dEV[:, a, self.par.T - 1, :] = np.sum(c[:, a, :, self.par.T - 1, np.newaxis] * dv[:, a, :, self.par.T - 1, :], axis=1) 
+                dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, :, self.par.T - 1, np.newaxis] * dv[:, a, :, self.par.T - 1, :], axis=1) 
 
             #Now we can perform proper time iteration for the remaining ages.
             t = self.par.T - 1
@@ -714,15 +724,15 @@ class GM:
                 t -= 1
                 #Choice specific value function derivatives
                 dv[:, :-1, :, t, :] = (dw[:-1, :, t, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
-                dEV[:, :-1, t, :] = np.sum(c[:, :-1, :, t, np.newaxis] * dv[:, :-1, :, t, :], axis=2)
+                dEV[:, :-1, t, :] = np.sum(P[:, :-1, :, t, np.newaxis] * dv[:, :-1, :, t, :], axis=2)
 
             # This concludes the calculation of the expected value function derivatives (wrt. beta0)
             # Next, calculate the derivatives of the choice probabilities. 
             # This is made easier by the fact that we have already calculated dv.
 
-            dlnP = np.zeros((c.shape) + (self.est.n_params,))
+            dlnP = np.zeros((P.shape) + (self.est.n_params,))
             #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
-            dlnP = 1/self.par.sigma * (dv[:, :, :, :, :] - np.sum(c[:, :, :, :, np.newaxis] * dv[:, :, :, :, :], axis=2)[:, :, np.newaxis, :, :])
+            dlnP = 1/self.par.sigma * (dv[:, :, :, :, :] - np.sum(P[:, :, :, :, np.newaxis] * dv[:, :, :, :, :], axis=2)[:, :, np.newaxis, :, :])
 
         return dlnP
 
@@ -739,7 +749,47 @@ gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
-gm.c_simulated_data()
+
+
+#%%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#%%
+
+
+# np.save("P_old", P)
+# P_old = np.load("P_old.npy")
+
+#%%
+gm.c_simulated_data(n_individuals=50_000)
 gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
 gm.c_theta0()
@@ -749,7 +799,8 @@ gm.c_theta0()
 method = "BFGS"
 gm.est.options["gtol"] = 1e-8
 #Make the initial values different from the true ones before testing estimation
-# gm.est.theta0 = gm.est.theta0 * np.array([0.5, 1.5])
+gm.est.theta0 = gm.est.theta0 * np.array([0.5, 1.5])
+
 
 res = gm.estimate(method=method)
 res
