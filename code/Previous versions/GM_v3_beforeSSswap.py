@@ -94,8 +94,8 @@ class GM:
         par.sigma = 0.8
 
         #Should be loaded from data later
-        par.alpha1 = np.repeat(np.array([0.2, 0.2, 0.3, 0.1])[:par.S][np.newaxis, :], par.T, axis=0)
-        par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2, 0.1])[:par.S][np.newaxis, :], par.T, axis=0)
+        par.alpha1 = np.repeat(np.array([0.2, 0.2, 0.3, 0.1])[:par.S][:, np.newaxis], par.T, axis=1)
+        par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2, 0.1])[:par.S][:, np.newaxis], par.T, axis=1)
         par.alpha3 = 1 - par.alpha1 - par.alpha2
 
         #Parameters to estimate later
@@ -141,7 +141,7 @@ class GM:
         """
         par = self.par
         # SxT
-        par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=0)
+        par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=1)
 
     def load_MASS(self, version="constant"):
         """ Creates a time series of MASS."""
@@ -153,7 +153,7 @@ class GM:
 
     def load_nominal_output(self):
         """ Creates a time series of nominal output, i.e. p^Y times Y in the paper."""
-        return np.repeat((np.ones(self.par.S))[np.newaxis, :], self.par.T, axis=0)
+        return np.repeat((np.ones(self.par.S))[:, np.newaxis], self.par.T, axis=1)
 
     def allocate(self):
         """ Allocate empty containers for solution objects. 
@@ -161,7 +161,7 @@ class GM:
         sol = self.sol
         par = self.par
 
-        sol.P = np.zeros((par.S, par.N_ages, par.T, par.S)) - 1 #4 dimensions: slag, a, t, s (choice)
+        sol.P = np.zeros((par.S, par.N_ages, par.S, par.T)) - 1 #4 dimensions: slag, a, s (choice), t
         sol.EV = np.zeros((par.S, par.N_ages, par.T)) - 99 #3 dimensions: slag, a, t
 
     def precompute(self):
@@ -174,12 +174,32 @@ class GM:
 
 
     def precompute_H(self):
-        """ Calculate all possible values of the human capital function. Dimensions: a x s"""
-        self.sol.H = np.exp(self.par.beta0[np.newaxis, :]/self.par.scale.beta0 * self.par.ages[:, np.newaxis])
+        """ Calculate all possible values of the human capital function. """
+        self.sol.H = np.exp(self.par.beta0[:, np.newaxis]/self.par.scale.beta0 * self.par.ages)
 
     def precompute_w(self):
-        """ Calculate all possible values of wages. w = r*H. Dimensions: a x t x s"""
-        self.sol.w = self.sol.H[:, np.newaxis, :] * self.par.r[np.newaxis, :, :]
+        """ Calculate all possible values of wages. w = r*H"""
+        self.sol.w = np.transpose(self.sol.H)[:, :, np.newaxis] * self.par.r[np.newaxis, :, :]
+
+    # @staticmethod
+    # def EV_closedform(sigma, arr, axis=0):
+    #     """ Calculate the expected value using the closed form logsum formula from the logit structure. 
+    #         Numerically stabilized by subtracting a max() value."""
+    #     if arr.ndim == 1:
+    #         return sigma * (np.max(arr / sigma) + np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma)), axis)))
+    #     elif arr.ndim == 2:
+    #         return sigma * (np.max(arr / sigma, axis=axis) + \
+    #             np.log(np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis)))
+
+    # #måske slå de her to sammen? så CCP og EV regnes samtidig, det er måske hurtigere? Nogle af de samme elementer indgår nemlig. (sum exp())
+    # @staticmethod
+    # def CCP_closedform(sigma, arr, axis=0):
+    #     """ Calculate the conditional choice probabilities (CCPs) using the closed form formula from the logit structure"""
+    #     if arr.ndim == 1:
+    #         return np.exp(arr / sigma - np.max(arr / sigma)) / np.sum(np.exp(arr / sigma - np.max(arr / sigma)))
+    #     elif arr.ndim == 2:
+    #         return np.divide(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), 
+    #                          np.sum(np.exp(arr / sigma - np.max(arr / sigma, axis=axis)[:, np.newaxis]), axis=axis)[:, np.newaxis])
 
     @staticmethod
     def closed_forms(sigma, arr):
@@ -189,44 +209,62 @@ class GM:
             sumexp = np.sum(np.exp(arr / sigma - constant))
             EV = sigma * (constant + np.log(sumexp))
             P = np.exp(arr / sigma - constant) / sumexp
-        if arr.ndim > 1:
-            constant = np.max(arr / sigma, axis=-1) #max for a given state space point, across choices. This becomes last axis when I move choice.
-            sumexp = np.sum(np.exp(arr / sigma - constant[..., np.newaxis]), axis=-1) #sumexp is used in both formulas, so we only calculate it once.
+        if arr.ndim == 2:
+            constant = np.max(arr / sigma, axis=1) #max for a given state space point, across choices. This becomes last axis when I move choice.
+            sumexp = np.sum(np.exp(arr / sigma - constant[:, np.newaxis]), axis=1) #sumexp is used in both formulas, so we only calculate it once.
             EV = sigma * (constant + np.log(sumexp))
-            P = np.exp(arr / sigma - constant[..., np.newaxis]) / sumexp[..., np.newaxis]
+            P = np.exp(arr / sigma - constant[:, np.newaxis]) / sumexp[:, np.newaxis]
         return (EV, P)
 
     def solve_worker(self):
         """ Solve the worker's problem by backwards induction for a given set of skill prices (r). 
             First we solve the last period using static expectations. Then we perform backwards 
             iteration from the remaining periods until period t = 0 using rational expectations. """
-        
-        #Unpack solution objects
         par = self.par
         sol = self.sol
+
+        #Unpack solution objects
         w = sol.w #offered wages.
         M = par.M #utility switching cost
         P = sol.P #conditional choice probabilities
         EV = sol.EV #expected value functions
 
-        #PART 0: Precompute EV at the retirement age for all periods (no continuation values)
-        a = par.N_ages - 1        
-        (EV[:, a, :], P[:, a, :, :]) = self.closed_forms(par.sigma, w[np.newaxis, a, :, :] - M[:, np.newaxis, :])        
-
-        #PART I (age iteration (64 -> 30) within the terminal period, static expectation)
+        #PART I (age iteration within the terminal period, static expectation)
         t = par.T - 1
+        a = par.N_ages - 1
+
+        #Start at the retirement age, where there are no continuation values
+        #Loop over different lagged sectors (slag)
+        
+        for slag in np.arange(0, par.S):
+            (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, w[a, :, t] - M[slag, :])
+
+        #Then iterate from age 64 to 30.
+        # a = 34
+        # slag = 0
         for a in reversed(np.arange(par.N_ages - 1)):
-            V_alternatives = w[np.newaxis, a, t, :] - M[:, :] + par.rho * EV[np.newaxis, :, a + 1, t]
-            # My choice of sector today enters EV tomorrow as slag. 
-            # Therefore the last dimension of w (the choice) must match the first dimension of EV (slag) 
-            (EV[:, a, t], P[:, a, t, :]) = self.closed_forms(par.sigma, V_alternatives)
+            for slag in np.arange(0, par.S):
+                V_alternatives = w[a, :, t] - M[slag, :] + par.rho * EV[:, a + 1, t]
+                #Nemt her stadig pga. simpel transformation function.
+                #når valget i dag påvirker min state i morgen kommer det ind her.
+                #Version 3: da mit valg i dag bare er det samme som min state i morgen kan jeg bare tilføje
+                #v[:, ...] og stadig få den korrekte continuation value.
+                (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, V_alternatives)
 
         #PART II (time iteration from T - 2 to 0.)
+        #Iterate from period T-2 (second to last period). Within each period. I don't have to iterate on age yet
+        # t = par.T - 2
         for t in reversed(np.arange(par.T - 1)):
-            # The value of an alternative is wage minus mobility costs + next period's continuation value discounted. 
-            # Again, the transpose() and newaxis on EV makes sure that the choice dimension of w and M lines up with the slag dimension of EV.
-            V_alternatives =  w[np.newaxis, :-1, t, :] - M[:, np.newaxis, :] + par.rho * EV[:, 1:, t + 1].transpose()[np.newaxis, :, :]
-            (EV[:, :-1, t], P[:, :-1, t, :]) = self.closed_forms(par.sigma, V_alternatives)
+            #Calculate the value function when age = 65, which has no continuation value
+            a = par.N_ages - 1
+            for slag in np.arange(0, par.S):
+                (EV[slag, a, t], P[slag, a, :, t]) = closed_forms(par.sigma, w[a, :, t] - M[slag, :])
+
+            #Calculate the value functions for ages 64 - 30
+            #H[:, 0:par.N_ages - 1] * r[:, t][:, np.newaxis] bruger mindre memory men kan ikke precomputes. Hvad er bedst?
+            #Løn +M på tværs af valget. Samme dimension er i continuation value. løn i sek 0 skal plusses med cont når jeg kommer fra sek 0.
+                V_alternatives =  w[0:par.N_ages - 1, :, t] - M[slag, :] + par.rho * EV[:, 1:, t + 1].transpose()
+                (EV[slag, 0:-1, t], P[slag, 0:-1, :, t]) = closed_forms(par.sigma, V_alternatives)
 
     def simulate(self):
         """ Simulate the model forward for a given set of skill prices. 
@@ -239,17 +277,17 @@ class GM:
         par = self.par
 
         #Measure how large a fraction of the people are at each point in the {state space x sector}.
-        self.sim.density = np.zeros((par.S, par.N_ages, par.T, par.S))
+        self.sim.density = np.zeros((par.S, par.N_ages, par.S, par.T))
         density = self.sim.density
 
         #This should be based on data later. Here we assume that all points in the state space are equally populated.
         #
         init_share = 1 / (par.S * par.N_ages * par.S)
-        density[:, :, 0, :] = init_share
+        density[:, :, :, 0] = init_share
 
         #Do something different than equally populated for the sake of illustration and debugging
-        density[:, :, 0, :] += np.array([- 1/2 * init_share, 0, 1/2 * init_share])[np.newaxis, np.newaxis, :]
-        assert np.around(np.sum(density[:, :, 0, :]), 7) == 1
+        density[:, :, :, 0] += np.array([- 1/2 * init_share, 0, 1/2 * init_share])[np.newaxis, np.newaxis, :]
+        assert np.around(np.sum(density[:, :, :, 0]), 7) == 1
 
         #Specify the distribution across the state space for entering cohorts.
         #Eventually this could be based on the distribution of the cohort that entered the last year we have data (e.g. 2016)
@@ -265,9 +303,9 @@ class GM:
             ## How many retired at the end the previous year?
             # The non-standard part is making sure people come into the model with age 30. 
             # np.sum(density[:, -1, :, t - 1]) sums over all parts of the state except age and time. Because we simply need ALL retiring people.
-            retiring = np.sum(density[:, -1, t - 1, :])
+            retiring = np.sum(density[:, -1, :, t - 1])
             ## Entering cohort:
-            density[:, 0, t, :] = retiring * EnteringStateSpaceDist[:, np.newaxis] * P[:, 0, t, :]
+            density[:, 0, :, t] = retiring * EnteringStateSpaceDist[:, np.newaxis] * P[:, 0, :, t]
 
             ## What will people of ages 31-65 do in this period.
             # The transpose moves the sector dimension in front of the age dimension. This is intuitive, since the current sector
@@ -275,9 +313,9 @@ class GM:
             # (s_lag, age, s_curr, time) 
             # We sum over period t-2 sectors (previous period's lagged sector) since they do not matter
             # for current choices.
-            density[:, 1:, t, :] = np.sum(density[:, :-1, t-1, :], axis=0).transpose()[:, :, np.newaxis] * P[:, 1:, t, :]
+            density[:, 1:, :, t] = np.sum(density[:, 0:-1, :, t-1], axis=0).transpose()[:, :, np.newaxis] * P[:, 1:, :, t]
 
-        assert all(np.around(np.sum(density, axis=(0, 1, 3)), 7) == 1), "Summing over state space (excluding time) and choices does not yield density == 1"
+        assert all(np.around(np.sum(density[:, :, :, :], axis=(0, 1, 2)), 7) == 1)
 
     def solve_humancap_equilibrium(self, print_out=True):
         """ Calculate the skill price consistent with human capital demand equalizing human capital supply.
@@ -287,11 +325,11 @@ class GM:
         df = self.diag.tables.skillprice_converge
 
         #Proposed wages from the first iteration
-        r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS[:, np.newaxis])
+        r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS)
 
         #Insert r0 and r1 for the current iteration
         iteration = 0
-        df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.T * self.par.S), r1.reshape(self.par.T * self.par.S)]).T
+        df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
 
         err_r = np.sum(np.abs(r1 - self.par.r))
         for iteration in range(1, self.sol.maxiter):
@@ -310,7 +348,7 @@ class GM:
                 self.solve_worker()
                 self.simulate()
                 #Proposed skill prices (S x T)
-                r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS[:, np.newaxis])
+                r1 = self.par.alpha1 * self.par.pY / (np.sum(self.sim.density, axis=(0,1)) * self.par.MASS)
                 #Save the initial and proposed skill prices (for diagnostics plotting)
                 df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
                 #Calculate deviation
@@ -358,8 +396,8 @@ class GM:
         fig = plt.figure(figsize=(5, 3.5), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
 
-        for s, name in enumerate(sector_names):
-            ax.plot(d[:, s], label=name)
+        for i, name in enumerate(sector_names):
+            ax.plot(d[i, :], label=name)
 
         ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
         ax.set_xlabel("Time")
@@ -378,8 +416,8 @@ class GM:
         fig = plt.figure(figsize=(5, 3.5), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
 
-        for s, name in enumerate(sector_names):
-            ax.plot(w[:, s], label=name)
+        for i, name in enumerate(sector_names):
+            ax.plot(w[i, :], label=name)
 
         ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
         ax.set_xlabel("Time")
@@ -390,13 +428,11 @@ class GM:
             self.savefig(fig, "average_wages")
 
     def uncond_switching_probs(self):
-        """ Construct table of unconditional switching probabilities. This calculates only net-flows. Should be recomputed for gross-flows.
-            e.g. such that with just two sectors, if workers are 50/50 dsitributed  and they all switch sectors, the probabilities do not become 0. """
+        """ Construct table of unconditional switching probabilities. """
         d = self.sim.density
-        #todo unconditional switching probabilities.
-        # #Do not include period 0, since the transition calculated from that means period -1 to period 0, which lies outside the model
-        # probs = np.mean(np.sum(d[:, :, 1:, :], axis=1) / np.sum(d[:, :, 1:, :], axis=(1, 3))[:, np.newaxis, :], axis=2)
-        # self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=self.par.sector_names, columns=self.par.sector_names)
+        #Do not include period 0, since the transition calculated from that means period -1 to period 0, which lies outside the model
+        probs = np.mean(np.sum(d[:, :, :, 1:], axis=1) / np.sum(d[:, :, :, 1:], axis=(1, 2))[:, np.newaxis, :], axis=2)
+        self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=self.par.sector_names, columns=self.par.sector_names)
 
     def c_pars_to_estimate(self, parameters=None, indexes=None):
         """ Constructs an ordered dictionary where keys are parameter names
@@ -567,14 +603,14 @@ class GM:
 
     def loglik(self, d, P):
         """Calculate the (negative of the) log likelihood for a sample d with choice probabilities c"""
-        return - np.sum(np.log(P[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"]])) / len(d)
+        return - np.sum(np.log(P[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"]])) / len(d)
 
     def score(self):
         """Calculate the score of the (negative of the) log likelihood. """
         #unpack
         d = self.est.simulated_data
         dlnP = self.gradients(parameter="beta0")
-        return - np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], :], axis=0) / len(d)
+        return - np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["s"], d["t"], :], axis=0) / len(d)
 
     def score_from_theta(self, theta):
         """ Helper function for self.score. This makes score a function of theta so that it can be used 
@@ -593,7 +629,7 @@ class GM:
         self.rng = default_rng(123456)
         data = pd.DataFrame(-1, 
                             index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
-                            columns=["s", "a", "slag"]).reset_index()[["i", "slag", "a", "t", "s"]] #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+                            columns=["s", "a", "slag"]).reset_index()[["i", "slag", "a", "s", "t"]] #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
 
         #Randomly generate starting ages that mean some are younger than 30 in the first period, so they enter model later
         data.loc[data.t == 0, "a"] = self.rng.integers(self.par.a_min - self.par.T + 1, self.par.a_max + 1, n_individuals)
@@ -619,7 +655,7 @@ class GM:
                     if size > 0:
                         #Randomly draw a chosen sector (based on choice probabilities i.e. indirectly the gumbel shocks)
                         data.loc[((data.t == t) & (data.a == a) & (data.slag == slag)), "s"] = \
-                            self.rng.choice(self.par.S, size=size, p=self.sol.P[slag, a - self.par.a_min, t, :])
+                            self.rng.choice(self.par.S, size=size, p=self.sol.P[slag, a - self.par.a_min, :, t])
         self.est.simulated_data = data.reset_index(drop=True)
 
     def plot_ll_3d(self, x_values, y_values):
@@ -661,34 +697,34 @@ class GM:
             idx = np.array([0, 1]) # <--- brug denne korrekt når jeg får flere parametre! Lige nu er den lort
 
             #Derivative of wage wrt. beta0. Calculated for all state space points once-and-for-all
-            dw[:, :, pte["beta0"], idx] = w[:, :, pte["beta0"]] * self.par.ages[:, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
+            dw[:, pte["beta0"], :, idx] = w[:, pte["beta0"], :].swapaxes(0, 1) * self.par.ages[np.newaxis, :, np.newaxis] / getattr(self.par.scale, parameter)
 
             a = self.par.a_max - self.par.a_min
 
             #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
-            dv[:, a, ...] = dw[np.newaxis, a, ...]
+            dv[:, a, :, :, :] = dw[np.newaxis, a, :, :, :]
 
             #Next, the last age, dEV
             #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
             #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-            dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
+            dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=1)
 
             # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
             # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
             # with age a + 1. 
             while a > 0:
                 a -= 1
-                dv[:, a, self.par.T - 1, :, :] = (dw[a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
+                dv[:, a, :, self.par.T - 1, :] = (dw[a, :, self.par.T - 1, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
                 #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-                dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1) 
+                dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, :, self.par.T - 1, np.newaxis] * dv[:, a, :, self.par.T - 1, :], axis=1) 
 
             #Now we can perform proper time iteration for the remaining ages.
             t = self.par.T - 1
             while t > 0:
                 t -= 1
-                #Choice specific value function derivatives. 
-                dv[:, :-1, t, :, :] = (dw[:-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
-                dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
+                #Choice specific value function derivatives
+                dv[:, :-1, :, t, :] = (dw[:-1, :, t, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
+                dEV[:, :-1, t, :] = np.sum(P[:, :-1, :, t, np.newaxis] * dv[:, :-1, :, t, :], axis=2)
 
             # This concludes the calculation of the expected value function derivatives (wrt. beta0)
             # Next, calculate the derivatives of the choice probabilities. 
@@ -696,10 +732,10 @@ class GM:
 
             dlnP = np.zeros((P.shape) + (self.est.n_params,))
             #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
-            dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+            dlnP = 1/self.par.sigma * (dv[:, :, :, :, :] - np.sum(P[:, :, :, :, np.newaxis] * dv[:, :, :, :, :], axis=2)[:, :, np.newaxis, :, :])
 
         return dlnP
-#%%
+
 
 
 # %% Run
@@ -713,30 +749,50 @@ gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
-gm.simulate()
+
+
+#%%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#%%
+
+
+# np.save("P_old", P)
+# P_old = np.load("P_old.npy")
+
+#%%
 gm.c_simulated_data(n_individuals=50_000)
 gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
 gm.c_theta0()
-
-#%%
-gm.sim.density.shape
-
-np.sum(gm.sim.density, axis=(0, 1, 3))
-
-P_old = np.load("P_old.npy")
-(P_old == gm.sol.P).all()
-
-# np.save("P_old", gm.sol.P)
-# np.save("density_old", gm.sim.density)
-# np.save("score_old", gm.score())
-
-#%%
-
-# P_old = np.load("P_old.npy")
-
-#%%
-
 
 #%%
 
@@ -744,6 +800,7 @@ method = "BFGS"
 gm.est.options["gtol"] = 1e-8
 #Make the initial values different from the true ones before testing estimation
 gm.est.theta0 = gm.est.theta0 * np.array([0.5, 1.5])
+
 
 res = gm.estimate(method=method)
 res
