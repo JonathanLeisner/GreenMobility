@@ -46,6 +46,7 @@ class GM:
         self.rng = default_rng(123456) #seed
 
         self.est.default_method = "BFGS"
+        self.est.partial = True
 
     def setup_statespace(self, simple_statespace):
         """ This function defines the attributes related to the state space. It allows setting 'simple_statespace'
@@ -91,14 +92,19 @@ class GM:
 
         #Parameters that are calibrated
         par.rho = 0.96
-        par.sigma = 0.8
 
         #Should be loaded from data later
         par.alpha1 = np.repeat(np.array([0.2, 0.2, 0.3, 0.1])[:par.S][np.newaxis, :], par.T, axis=0)
         par.alpha2 = np.repeat(np.array([0.2, 0.2, 0.2, 0.1])[:par.S][np.newaxis, :], par.T, axis=0)
         par.alpha3 = 1 - par.alpha1 - par.alpha2
 
-        #Parameters to estimate later
+        #Parameters to be estimated later
+
+        #Gumbel shock scale parameter
+        par.sigma = 0.8
+
+        
+
         #Human capital function parameters
         # par.beta0 = np.array([0.002, 0.006, 0.012, 0.008])[:par.S] #1-dimensional over sectors. 
         par.beta0 = np.array([0.2, 0.6, 1.2, 0.8])[:par.S] #1-dimensional over sectors. 
@@ -111,6 +117,10 @@ class GM:
         else:
             par.xi_in = np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
             par.xi_out = np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
+
+        #Define parameter groups. These are used in self.gradient().
+        par.non_utility_pars = ["sigma"]
+        par.utility_pars = ["beta0", "xi_in", "xi_out"]
 
         # #Replace default values by those given explicitly to the method
         for k, v in kwargs.items():
@@ -324,6 +334,7 @@ class GM:
 
 
     def fig_skillprice_converge(self, save=False):
+        """Figure showing the time series of unit skill prices (r) at various iterations from the human capital equilibrium function. """
         idx = pd.IndexSlice
         df = self.diag.tables.skillprice_converge
         #Remove nans (iterations that were not reached before convergence)
@@ -435,22 +446,39 @@ class GM:
                 n_params += len(index)
         self.est.n_params = n_params
 
+    def c_theta_idx(self):
+        n = 0
+        theta_idx = OrderedDict()
+        for parameter, index in pte.items():
+            if index is not None:
+                theta_idx[parameter] = np.arange(n, n + len(index))
+                n += len(index)
+            else:
+                #scalar parameter vector
+                theta_idx[parameter] = np.array([n])
+                n += 1
+        self.est.theta_idx = theta_idx
+
     def c_theta0(self):
         """ Constructs a single, 1-dimensional array containing all the parameters to be estimated.
             Requires self.pars_to_estimate to be defined (aliased pte here). I use the name theta0 as 
-            the starting values of the parameters to be estimated. """
+            the starting values of the parameters to be estimated. 
+            The actual parameter values used are those stored in par when run. """
         pte = self.est.pars_to_estimate
+        theta_idx = self.est.theta_idx
         #Initialize theta0 with the correct length.
-        theta0 = np.zeros(np.sum([len(pte[k]) if pte[k] is not None else 1 for k in pte]))
-        n = 0 #counter for index in theta0 itself
+        # theta0 = np.zeros(np.sum([len(pte[k]) if pte[k] is not None else 1 for k in pte]))
+        # theta0 = np.zeros(max(theta_idx[next(reversed(theta_idx))]) + 1) #last element of theta_idx stores the
+        theta0 = np.zeros(self.est.n_params)
+        # n = 0 #counter for index in theta0 itself
 
         for par, index in pte.items():
             if index is None:
-                theta0[n] = getattr(self.par, par)
-                n += 1
+                theta0[theta_idx[par]] = getattr(self.par, par)
+                # n += 1
             else:
-                theta0[n : n + len(index)] = getattr(self.par, par)[index]
-                n += len(index)
+                theta0[theta_idx[par]] = getattr(self.par, par)[index]
+                # n += len(index)
         self.est.theta0 = theta0
 
     @staticmethod
@@ -545,8 +573,9 @@ class GM:
         self.precompute() #H changes with parameters and so needs to be precomputed again.
         self.solve_worker()
         if not self.est.partial:
-            self.solve_humancap_equilibrium()
-            self.simulate()
+            # self.solve_humancap_equilibrium()
+            self.GE_humcap()
+        self.simulate()
 
     def obj_func(self, theta):
         """ Update parameters, calculate equilibrium and evaluate loglik. If partial = True, 
@@ -573,7 +602,7 @@ class GM:
         """Calculate the score of the (negative of the) log likelihood. """
         #unpack
         d = self.est.simulated_data
-        dlnP = self.gradients(parameter="beta0")
+        dlnP = self.gradients()
         return - np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], :], axis=0) / len(d)
 
     def score_from_theta(self, theta):
@@ -642,63 +671,85 @@ class GM:
         ax.plot_surface(X, Y, Z, cmap ='viridis', edgecolor ='green')
         return (fig, ax)
 
-    def gradients(self, parameter):
+    def gradients(self):
         """ Calculates analytic gradients of the log likelihood function. """
         
         #Unpack
         w = self.sol.w
         P = self.sol.P
         pte = self.est.pars_to_estimate
+        theta_idx = self.est.theta_idx
 
         #Containers for results
         dEV = np.zeros(self.sol.EV.shape + (self.est.n_params,))
         dw = np.zeros(w.shape + (self.est.n_params,))
         dv = np.zeros(P.shape + (self.est.n_params,)) #derivatives of choice-specific value functions
 
-        if parameter == "beta0":
+        #todo: VI KAN KUN ESTIMERE 1 PARAMETER LIGE NU, OG DET ER BETA0. 
+        #beta0 og xi-parametre skal sættes sammen, da alt fra dv kan vektoriseres. Men sigma kan ikke det samme.
+        #til sidst skal det hele så samles i en enkelt dlnP. 
+        #JEG udvikler dette når jeg har skrevet overleaf omkring ligevægtsgradienter OG sendt dem til Bertel.
+        parameter = "beta0"
+        # for parameter in pte:
+        #Derivative of wage wrt. beta0. Calculated for all state space points once-and-for-all
+        dw[:, :, pte[parameter], theta_idx[parameter]] = w[:, :, pte[parameter]] * self.par.ages[:, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
 
-            #Index in theta (vector of parameters to be estimated)
-            idx = np.array([0, 1]) # <--- brug denne korrekt når jeg får flere parametre! Lige nu er den lort
+        a = self.par.a_max - self.par.a_min
 
-            #Derivative of wage wrt. beta0. Calculated for all state space points once-and-for-all
-            dw[:, :, pte["beta0"], idx] = w[:, :, pte["beta0"]] * self.par.ages[:, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
+        #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
+        dv[:, a, ...] = dw[np.newaxis, a, ...]
 
-            a = self.par.a_max - self.par.a_min
+        #Next, the last age, dEV
+        #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
+        #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
+        dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
 
-            #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
-            dv[:, a, ...] = dw[np.newaxis, a, ...]
+        # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
+        # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
+        # with age a + 1. 
+        while a > 0:
+            a -= 1
+            dv[:, a, self.par.T - 1, :, :] = (dw[a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
+            #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
+            dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1) 
 
-            #Next, the last age, dEV
-            #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
-            #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-            dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
+        #Now we can perform proper time iteration for the remaining ages.
+        t = self.par.T - 1
+        while t > 0:
+            t -= 1
+            #Choice specific value function derivatives. 
+            dv[:, :-1, t, :, :] = (dw[:-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
+            dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
 
-            # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
-            # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
-            # with age a + 1. 
-            while a > 0:
-                a -= 1
-                dv[:, a, self.par.T - 1, :, :] = (dw[a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
-                #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-                dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1) 
+        # This concludes the calculation of the expected value function derivatives (wrt. beta0)
+        # Next, calculate the derivatives of the choice probabilities. 
+        # This is made easier by the fact that we have already calculated dv.
 
-            #Now we can perform proper time iteration for the remaining ages.
-            t = self.par.T - 1
-            while t > 0:
-                t -= 1
-                #Choice specific value function derivatives. 
-                dv[:, :-1, t, :, :] = (dw[:-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
-                dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
-
-            # This concludes the calculation of the expected value function derivatives (wrt. beta0)
-            # Next, calculate the derivatives of the choice probabilities. 
-            # This is made easier by the fact that we have already calculated dv.
-
-            dlnP = np.zeros((P.shape) + (self.est.n_params,))
-            #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
-            dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+        dlnP = np.zeros((P.shape) + (self.est.n_params,))
+        #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
+        dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
 
         return dlnP
+
+    def GE_humcap(self):
+        res = optimize.minimize(self.objfunc_ED, 
+                                self.par.r, 
+                                method="BFGS", 
+                                jac=None,
+                                tol=1e-9,
+                                options={"disp":True, "maxiter":1000})
+        return res
+
+    def objfunc_ED(self, r):
+        self.par.r = r.reshape(self.par.r.shape) #Update rental prices
+        self.precompute_w() #With new skill prices, update wages
+        self.solve_worker() #solve the worker's problem
+        self.simulate()
+        #Calculate labor supply and labor demand
+        labsup = np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2))) * self.par.MASS[:, np.newaxis]
+        labdem = self.par.alpha1 * self.par.pY / self.par.r
+        objfunc = np.sum(np.square(labdem - labsup)) #sum of squared deviances (scalar function)
+        return objfunc
 #%%
 
 
@@ -714,18 +765,34 @@ gm.allocate()
 gm.precompute()
 gm.solve_worker()
 gm.simulate()
+gm.solve_humancap_equilibrium()
+r_old = gm.par.r.copy()
+# gm.par.r = gm.par.r * 1.5
+res = gm.GE_humcap()
+
+res.x.reshape(r_old.shape) - r_old
+np.isclose(res.x.reshape(r_old.shape), r_old)
+
+#%%
+#Perturb and try again
+gm.par.beta0[np.array([1, 2])] *= np.array([0.5, 1.5])
+res = gm.GE_humcap()
+
+res
+
+#%%
+
+#%%
 gm.c_simulated_data(n_individuals=50_000)
-gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
+gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=False)
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
+gm.c_theta_idx()
 gm.c_theta0()
 
 #%%
-gm.sim.density.shape
 
-np.sum(gm.sim.density, axis=(0, 1, 3))
 
-P_old = np.load("P_old.npy")
-(P_old == gm.sol.P).all()
+#%%
 
 # np.save("P_old", gm.sol.P)
 # np.save("density_old", gm.sim.density)
@@ -733,17 +800,10 @@ P_old = np.load("P_old.npy")
 
 #%%
 
-# P_old = np.load("P_old.npy")
-
-#%%
-
-
-#%%
-
 method = "BFGS"
-gm.est.options["gtol"] = 1e-8
+# gm.est.options["gtol"] = 1e-8
 #Make the initial values different from the true ones before testing estimation
-gm.est.theta0 = gm.est.theta0 * np.array([0.5, 1.5])
+gm.est.theta0 = gm.est.theta0 * np.array([0.9, 1.1])
 
 res = gm.estimate(method=method)
 res
