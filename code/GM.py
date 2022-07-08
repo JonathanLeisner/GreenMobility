@@ -182,7 +182,6 @@ class GM:
         #Precompute wages (a x s x t) = (36, 3, 4)
         self.precompute_w()
 
-
     def precompute_H(self):
         """ Calculate all possible values of the human capital function. Dimensions: a x s"""
         self.sol.H = np.exp(self.par.beta0[np.newaxis, :]/self.par.scale.beta0 * self.par.ages[:, np.newaxis])
@@ -249,45 +248,51 @@ class GM:
         par = self.par
 
         #Measure how large a fraction of the people are at each point in the {state space x sector}.
-        self.sim.density = np.zeros((par.S, par.N_ages, par.T, par.S))
-        density = self.sim.density
+        density = np.zeros((par.S, par.N_ages, par.T, par.S))
 
         #This should be based on data later. Here we assume that all points in the state space are equally populated.
         #
-        init_share = 1 / (par.S * par.N_ages * par.S)
-        density[:, :, 0, :] = init_share
+        # init_share = 1 / (par.S * par.N_ages * par.S)
+        density[..., 0, :] = self.sim.initDist[..., np.newaxis] * P[..., 0, :] #initial choice
 
         #Do something different than equally populated for the sake of illustration and debugging
-        density[:, :, 0, :] += np.array([- 1/2 * init_share, 0, 1/2 * init_share])[np.newaxis, np.newaxis, :]
-        assert np.around(np.sum(density[:, :, 0, :]), 7) == 1
+        # density[:, :, 0, :] += np.array([- 1/2 * init_share, 0, 1/2 * init_share])[np.newaxis, np.newaxis, :]
+        assert np.around(np.sum(density[:, :, 0, :]), 8) == 1
 
         #Specify the distribution across the state space for entering cohorts.
         #Eventually this could be based on the distribution of the cohort that entered the last year we have data (e.g. 2016)
         #Right now the only part of the state space that is relevant to specify is the lagged sector choice, since a = 30 by construction.
         #Just insert some non-uniform values
-        enter_share = 1 / par.S 
-        EnteringStateSpaceDist = np.zeros(shape=(par.S)) + enter_share + np.array([- 1/2 * enter_share, 0, 1/2 * enter_share])
+        # enter_share = 1 / par.S 
+        # EnteringStateSpaceDist = np.zeros(shape=(par.S)) + enter_share + np.array([- 1/2 * enter_share, 0, 1/2 * enter_share])
+        EnterDist = self.sim.EnterDist
+
+        # assert np.sum(EnterDist, axis=0)
 
         #loop over t starting from t = 0 going until the second to last period (which inserts values into the last). We only replace values in density in years 1, 2, ... 
         #Since the starting year is data.
-        t = 1
+        # t = 1
         for t in np.arange(1, par.T):
             ## How many retired at the end the previous year?
             # The non-standard part is making sure people come into the model with age 30. 
             # np.sum(density[:, -1, :, t - 1]) sums over all parts of the state except age and time. Because we simply need ALL retiring people.
             retiring = np.sum(density[:, -1, t - 1, :])
-            ## Entering cohort:
-            density[:, 0, t, :] = retiring * EnteringStateSpaceDist[:, np.newaxis] * P[:, 0, t, :]
+            ## Entering cohort of age 30:
+            density[:, 0, t, :] = retiring * EnterDist[:, t, np.newaxis] * P[:, 0, t, :]
 
             ## What will people of ages 31-65 do in this period.
             # The transpose moves the sector dimension in front of the age dimension. This is intuitive, since the current sector
             # becomes next period's lagged sector. And it needs to line up with the policy function which has dimensions
             # (s_lag, age, s_curr, time) 
             # We sum over period t-2 sectors (previous period's lagged sector) since they do not matter
-            # for current choices.
-            density[:, 1:, t, :] = np.sum(density[:, :-1, t-1, :], axis=0).transpose()[:, :, np.newaxis] * P[:, 1:, t, :]
+            # for current choices. #We move previous' period's choice from the last index to the place of slag so it matches to P
+            density[:, 1:, t, :] = np.sum(density[:, :-1, t-1, :], axis=0).swapaxes(0, -1)[:, :, np.newaxis] * P[:, 1:, t, :]
 
         assert all(np.around(np.sum(density, axis=(0, 1, 3)), 7) == 1), "Summing over state space (excluding time) and choices does not yield density == 1"
+        self.sim.density = density
+
+# np.sum(density, axis=(0, 1, 3))[all(np.around(np.sum(density, axis=(0, 1, 3)), 7) != 1)]
+
 
     def solve_humancap_equilibrium(self, print_out=True):
         """ Calculate the skill price consistent with human capital demand equalizing human capital supply.
@@ -325,6 +330,20 @@ class GM:
                 df.loc[idx[:, :], idx[:, iteration]] = np.array([self.par.r.reshape(self.par.S * self.par.T), r1.reshape(self.par.S * self.par.T)]).T
                 #Calculate deviation
                 err_r = np.sum(np.abs(r1 - self.par.r))
+
+    def l_cohorts(self, simulated_data=True):
+        if simulated_data:
+            d = self.est.simulated_data
+        else:
+            raise Exception("Can only do simulated data at the moment.")
+        self.sim.EnterDist = d[d.a == self.par.a_min].groupby("t")["slag"].value_counts(normalize=True).to_numpy().reshape((self.par.T, self.par.S)).swapaxes(0, 1)
+
+    def l_init_distribution(self, simulated_data=True):
+        if simulated_data: #FEJL HER
+            d = gm.est.simulated_data
+        else:
+            raise Exception("Can only do simulated data at the moment.")
+        self.sim.initDist = d[d.t == 0][["slag", "a"]].value_counts(normalize=True).sort_index().to_numpy().reshape((self.par.S, self.par.N_ages))
 
     # def post_estimation(self):
     #     """This method calculates post-estimation quantities such as TFP (A), 
@@ -447,6 +466,8 @@ class GM:
         self.est.n_params = n_params
 
     def c_theta_idx(self):
+        pte = self.est.pars_to_estimate
+
         n = 0
         theta_idx = OrderedDict()
         for parameter, index in pte.items():
@@ -615,14 +636,15 @@ class GM:
         return self.score()
 
     def c_simulated_data(self, n_individuals=100_000):
-        """ Simulate data from the model currently stored. We simulate 'n_individuals' individuals. 
+        """ Simulate data from the model currently stored. We simulate N = 'n_individuals' individuals. 
             The total number of observations (NxT) is random because we simulate individuals of all ages.
             This means that some people only enter the sample 1 year because that is the year they turn 30.
             Other individuals only enter the sample in 3 years because they start at the age of 63. """
         self.rng = default_rng(123456)
         data = pd.DataFrame(-1, 
                             index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
-                            columns=["s", "a", "slag"]).reset_index()[["i", "slag", "a", "t", "s"]] #i for individual, t for year, s for sector (chosen), a for age, slag for lagged sector
+                            columns=["s", "a", "slag"]).reset_index()[["i", "slag", "a", "t", "s"]] 
+                            #i for individual, slag for lagged sector, a for age, t for year, s for sector (chosen) 
 
         #Randomly generate starting ages that mean some are younger than 30 in the first period, so they enter model later
         data.loc[data.t == 0, "a"] = self.rng.integers(self.par.a_min - self.par.T + 1, self.par.a_max + 1, n_individuals)
@@ -633,7 +655,7 @@ class GM:
         #For example, this deletes period 0 observations for those that are 29 or younger in that year
         data = data.loc[((data.a <= self.par.a_max) & (data.a >= self.par.a_min))]
 
-        #Randomly generate period -1 sector choices (period 0 sector lagged)
+        #Randomly (uniformly) generate period -1 sector choices (period 0 sector lagged)
         data.loc[data.groupby("i").apply(lambda x: min(x.index)).to_numpy(), "slag"] = self.rng.integers(0, self.par.S, n_individuals)
 
         for t in np.arange(0, self.par.T):
@@ -750,16 +772,27 @@ class GM:
         labdem = self.par.alpha1 * self.par.pY / self.par.r
         objfunc = np.sum(np.square(labdem - labsup)) #sum of squared deviances (scalar function)
         return objfunc
+
 #%%
+
+
+gm = GM()
+gm.setup(simple_statespace=False)
+gm.c_human_capital_unit_prices()
+gm.allocate()
+gm.precompute()
+gm.solve_worker()
+gm.c_simulated_data()
+gm.l_cohorts()
+gm.l_init_distribution()
+#%%
+gm.simulate()
 
 
 # %% Run
 
 gm = GM()
-# gm.setup(beta0=np.array([-0.1, -0.4, 0.8]))
 gm.setup(simple_statespace=False)
-# gm.par.beta0 = gm.par.beta0 - 0.1
-
 gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
@@ -784,7 +817,7 @@ res
 
 #%%
 gm.c_simulated_data(n_individuals=50_000)
-gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=False)
+gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
 gm.c_theta_idx()
 gm.c_theta0()
@@ -811,7 +844,9 @@ res
 #%% Compare analytic and numeric gradients
 
 gm.est.analytic_gradients = False
-assert optimize.check_grad(gm.obj_func, gm.score_from_theta, np.array([0.003, 0.001])) < 1e-7, \
+
+
+assert optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]]) < 1e-7, \
        "Differences between analytic and numeric gradients are too large"
 
 #%% 
@@ -844,16 +879,3 @@ gm.fig_employment_shares()
 
 #%% Shocked system
 
-gm = GM(name="Higher dirty wage")
-gm.setup()
-gm.c_human_capital_unit_prices()
-
-#Add some more wage to the dirty sector
-gm.par.r[-1, :] += 1
-
-gm.allocate()
-gm.precompute()
-gm.solve()
-gm.simulate()
-gm.fig_avg_wages()
-gm.fig_employment_shares()
