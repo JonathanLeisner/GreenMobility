@@ -24,7 +24,7 @@ class GM:
     """ Class to solve the model presented in Leisner (2023). 
         Generally, the notation c_[name] for methods means construct/create/calculate an object or attribute called [name].
     """
-    def __init__(self, name = None):
+    def __init__(self, name = None, endo_D=True, analytic_grad_ED=True):
         self.sol = SimpleNamespace()
         self.par = SimpleNamespace()
         self.par.scale = SimpleNamespace() #collects scalar scales for all parameters.
@@ -47,6 +47,17 @@ class GM:
 
         self.est.default_method = "BFGS"
         self.est.partial = True
+        self.setup_sim(endo_D=endo_D, analytic_grad_ED=analytic_grad_ED)
+
+    def setup_sim(self, **kwargs):
+        """ Sets up settings needed to simulate. 
+            The keywords that can be used are:
+            endo_D : {True/False}. Switching between endogenous and exogenous D (density).
+            analytic_grad_ED : {True/False}. Switch between numeric jacobian and analytic jacobian for GE problem. """
+
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
 
     def setup_statespace(self, simple_statespace):
         """ This function defines the attributes related to the state space. It allows setting 'simple_statespace'
@@ -72,12 +83,16 @@ class GM:
         par.ages = np.arange(par.a_min, par.a_max + 1)
         par.N_ages = par.a_max + 1 - par.a_min
 
+        #Helper object for calculating gradients of excess labor demand. Used e.g. in partial_ED 
+        self.ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)])
+
     def setup(self, simple_statespace=False, **kwargs):
         """ Initiates parameter values at their default values. Also populates meta settings. Specify named
             'keyword=value' to the function to replace default values by those specified in 'value'. 
         """
         
         par = self.par
+        par.groups = SimpleNamespace()
         self.setup_statespace(simple_statespace)
         
         #Meta-settings
@@ -119,8 +134,9 @@ class GM:
             par.xi_out = np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
 
         #Define parameter groups. These are used in self.gradient().
-        par.non_utility_pars = ["sigma"]
-        par.utility_pars = ["beta0", "xi_in", "xi_out"]
+        par.groups.sigma = ["sigma"]
+        par.groups.utility = ["beta0", "xi_in", "xi_out"]
+        par.groups.prices = ["r"]
 
         # #Replace default values by those given explicitly to the method
         for k, v in kwargs.items():
@@ -237,8 +253,35 @@ class GM:
             V_alternatives =  w[np.newaxis, :-1, t, :] - M[:, np.newaxis, :] + par.rho * EV[:, 1:, t + 1].transpose()[np.newaxis, :, :]
             (EV[:, :-1, t], P[:, :-1, t, :]) = self.closed_forms(par.sigma, V_alternatives)
 
+    def c_D_from_data(self, simulated_data=True):
+        if simulated_data:
+            d = gm.est.simulated_data
+        else:
+            raise Exception()
+        mi = pd.MultiIndex.from_product([[s for s in np.arange(0, self.par.S)], list(self.par.ages), [t for t in np.arange(0, self.par.T)]], 
+                                        names=["slag", "a", "t"])
+        D = (pd.Series(0, index=mi).add((d.groupby(["slag", "a", "t"]).size() / d.groupby("t").size()), fill_value=0)
+             .to_numpy()
+             .reshape((self.par.S, self.par.N_ages, self.par.T)))
+        self.est.D = D
+
     def simulate(self):
-        """ Simulate the model forward for a given set of skill prices. 
+        """ Method to simulate. This is a wrapper method that chooses between various ways of simulating from the model."""
+        if self.endo_D:
+            self.simulate_endoD()
+        elif not self.endo_D:
+            self.simulate_exoD()
+
+    def simulate_exoD(self):
+        """ Simulate the model forward for a given set of skill prices and a given quantity of D (density) in each period. 
+            Strictly speaking, this implies that the model contradicts itself, because it does not incorporate the number of 
+            individuals choosing a specific action causing the true D to shifts. Instead, here we keep D fixed to its data target.
+            Presumes that the method c_D_from_data() has been run beforehand. """
+        self.sim.density = self.est.D[..., np.newaxis] * self.sol.P
+
+
+    def simulate_endoD(self):
+        """ Simulate the model forward for a given set of skill prices. D is endogenous, hence it gets updated according to actual choices in model. 
         We initialize the model in a point where all points of the state space are equally 
         populated. Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
@@ -247,7 +290,7 @@ class GM:
         P = self.sol.P
         par = self.par
 
-        #Measure how large a fraction of the people are at each point in the {state space x sector}.
+        #Measure how large a fraction of the people are at each point in the {state space x sector}. Symbol D in the paper + a choice dimension.
         density = np.zeros((par.S, par.N_ages, par.T, par.S))
 
         #This should be based on data later. Here we assume that all points in the state space are equally populated.
@@ -339,8 +382,8 @@ class GM:
         self.sim.EnterDist = d[d.a == self.par.a_min].groupby("t")["slag"].value_counts(normalize=True).to_numpy().reshape((self.par.T, self.par.S)).swapaxes(0, 1)
 
     def l_init_distribution(self, simulated_data=True):
-        if simulated_data: #FEJL HER
-            d = gm.est.simulated_data
+        if simulated_data:
+            d = self.est.simulated_data
         else:
             raise Exception("Can only do simulated data at the moment.")
         self.sim.initDist = d[d.t == 0][["slag", "a"]].value_counts(normalize=True).sort_index().to_numpy().reshape((self.par.S, self.par.N_ages))
@@ -382,14 +425,14 @@ class GM:
     def fig_employment_shares(self, save=False):
         """ Creates a figure of employment shares in each sector, over time"""
         #Unpack
-        d = np.sum(self.sim.density, axis=(0, 1))
+        emp = np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2)))
         sector_names = self.par.sector_names
 
         fig = plt.figure(figsize=(5, 3.5), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
 
         for s, name in enumerate(sector_names):
-            ax.plot(d[:, s], label=name)
+            ax.plot(emp[:, s], label=name)
 
         ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
         ax.set_xlabel("Time")
@@ -456,14 +499,22 @@ class GM:
                     assert isinstance(indexes[i], np.ndarray)
                     pars_to_estimate[par] = indexes[i]
         self.est.pars_to_estimate = pars_to_estimate
+        #Follow-up helper objects
+        self.c_n_params()
+        self.c_gs()
 
+    def c_n_params(self):
         n_params = 0
-        for _, index in pars_to_estimate.items():
+        for _, index in self.est.pars_to_estimate.items():
             if index is None:
                 n_params += 1
             else:
                 n_params += len(index)
         self.est.n_params = n_params
+
+    def c_gs(self):
+        """Define the parameter groups (shorthand: gs) to be estimated. It is in inferred directly from self.est.pars_to_estimate."""
+        self.est.gs = set([g for g in vars(self.par.groups).keys() for p in self.est.pars_to_estimate if p in vars(self.par.groups)[g]])
 
     def c_theta_idx(self):
         pte = self.est.pars_to_estimate
@@ -693,100 +744,339 @@ class GM:
         ax.plot_surface(X, Y, Z, cmap ='viridis', edgecolor ='green')
         return (fig, ax)
 
-    def gradients(self):
-        """ Calculates analytic gradients of the log likelihood function. """
-        
-        #Unpack
-        w = self.sol.w
+    def partial_ED(self, theta_or_r):
+        #unpack
         P = self.sol.P
-        pte = self.est.pars_to_estimate
-        theta_idx = self.est.theta_idx
+        D = self.est.D
+        par = self.par
 
-        #Containers for results
-        dEV = np.zeros(self.sol.EV.shape + (self.est.n_params,))
-        dw = np.zeros(w.shape + (self.est.n_params,))
-        dv = np.zeros(P.shape + (self.est.n_params,)) #derivatives of choice-specific value functions
+        if theta_or_r == "theta":
+            assert len(self.est.gs) == 1
+            if "utility" in self.est.gs:
+                du = self.du("utility")
+                dv = self.dv_and_dEV(du, "utility")
+                dP =  P[..., np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
+                dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)] * \
+                        np.sum(D[(..., np.newaxis) + (np.newaxis,)] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
 
-        #todo: VI KAN KUN ESTIMERE 1 PARAMETER LIGE NU, OG DET ER BETA0. 
-        #beta0 og xi-parametre skal sættes sammen, da alt fra dv kan vektoriseres. Men sigma kan ikke det samme.
-        #til sidst skal det hele så samles i en enkelt dlnP. 
-        #JEG udvikler dette når jeg har skrevet overleaf omkring ligevægtsgradienter OG sendt dem til Bertel.
-        parameter = "beta0"
-        # for parameter in pte:
-        #Derivative of wage wrt. beta0. Calculated for all state space points once-and-for-all
-        dw[:, :, pte[parameter], theta_idx[parameter]] = w[:, :, pte[parameter]] * self.par.ages[:, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
+                dH = - dHsup #parameters cannot affect demand in the model so I simply leave it out
 
-        a = self.par.a_max - self.par.a_min
+        elif theta_or_r == "r":
+            
+            ts_indexes = self.ts_indexes
+            
+            du = self.du("r")
+            dv = self.dv_and_dEV(du, "r")
+
+            dP =  P[..., np.newaxis, np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
+            dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*2] * \
+                     np.sum(D[(..., np.newaxis) + (np.newaxis,)*2] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
+
+            dHdem = np.zeros((par.T, par.S, par.T, par.S))
+            dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
+
+            dH = dHdem - dHsup
+        return dH
+
+    # def grad_ED_r(self):
+    #     """Calculate analytic gradients of the excess demand functions with respect to skill prices. """
+    #     H = self.sol.H
+    #     P = self.sol.P
+    #     par = self.par
+    #     ndim_r = 2
+    #     D = self.est.D
+    #     dEV = np.zeros(self.sol.EV.shape + (par.T, par.S))
+    #     dv = np.zeros(P.shape + (par.T, par.S))
+
+    #     du = np.zeros((par.S, par.N_ages, par.T, par.S, par.T, par.S)) #does not depend on slag when we diff wrt. r
+    #     # du = np.arange(0, par.N_ages*par.T*par.S*par.T*par.S).reshape((par.N_ages, par.T, par.S, par.T, par.S), order="F")
+
+    #     #Calculates du once-and-for-all 
+    #     idx_arr = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)]) #Object for picking combinations where st == s't'.
+    #     du[:, :, idx_arr[:, 0], idx_arr[:, 1], idx_arr[:, 0], idx_arr[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...] #H has no t-dimension (given a), and is repeated for each t.
+
+    #     a = self.par.a_max - self.par.a_min
+    #     dv[:, a, ...] = du[:, a, ...]
+
+    #     #Next, the last age, dEV
+    #     #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
+    #     #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
+    #     dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis, np.newaxis] * dv[:, a, ...], axis=2)
+    #     while a > 0:
+    #         a -= 1
+    #         dv[:, a, self.par.T - 1, ...] = du[:, a, self.par.T - 1, ...] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :][np.newaxis, ...]
+    #         #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
+    #         dEV[:, a, self.par.T - 1, ...] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis, np.newaxis] * dv[:, a, self.par.T - 1, ...], axis=1)
+
+    #     t = self.par.T - 1
+    #     while t > 0:
+    #         t -= 1
+    #         #Choice specific value function derivatives. 
+    #         dv[:, :-1, t, ...] = du[:, :-1, t, ...] + self.par.rho * dEV[:, 1:, t + 1, ...].swapaxes(0, 1)[np.newaxis, ...]
+    #         #not necessary to c this when t = 0 actually, the continuation value in the initial period enters nowhere.
+    #         dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis, np.newaxis] * dv[:, :-1, t, ...], axis=2)
+
+    #     # dP = np.zeros((P.shape) + (par.T, par.S))
+    #     #dP has shape (slag, a, t, s, t', s')
+    #     dP =  P[..., np.newaxis, np.newaxis]/self.par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
+    #     dHsup =  gm.par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*ndim_r] * \
+    #         np.sum(D[(..., np.newaxis) + (np.newaxis,)*ndim_r] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
+
+    #     dHdem = np.zeros((par.T, par.S, par.T, par.S))
+    #     dHdem[idx_arr[:, 0], idx_arr[:, 1], idx_arr[:, 0], idx_arr[:, 1]] = np.reshape(gm.par.alpha1 * gm.par.pY / (- np.square(gm.par.r)), (par.T*par.S), order="F")
+
+    #     dH = dHdem - dHsup
+    #     return dH
+
+    def du(self, g):
+        #I make it such that du always has the same dimension for a given parameter type (r or actual parameter).
+        # assert g in ["utility", "sigma", "price"]. g refers to parameter type groups.
+
+        #unpack
+        par = self.par
+        
+        if g == "utility":
+            #unpack
+            pte = self.est.pars_to_estimate
+            theta_idx = self.est.theta_idx
+            w = self.sol.w
+
+            du = np.zeros(self.sol.P.shape + (self.est.n_params,)) #wrong when sigma is also estimated I think.
+            for para in [k for k in pte.keys() if k in par.groups.utility]: #could this be precomputed? Yes, in setup_estimation perhaps. 
+                if para == "beta0":
+                    du[..., pte[para], theta_idx[para]] = w[..., pte[para]] * par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(par.scale, para)
+                else:
+                    raise Exception()
+        if g == "r":
+            #unpack
+            H = self.sol.H
+            ts_indexes = self.ts_indexes
+
+            #Allocate
+            du = np.zeros((par.S, par.N_ages, par.T, par.S, par.T, par.S)) #does not depend on slag when we diff wrt. r
+            
+            #for testing, delete later:
+            # du = np.arange(0, par.N_ages*par.T*par.S*par.T*par.S).reshape((par.N_ages, par.T, par.S, par.T, par.S), order="F")
+             
+            # ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)]) #Object for picking combinations where st == s't'.
+            du[:, :, ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...] #H has no t-dimension (given a), and is repeated for each t.
+        
+        #note: dimensions of du vary depending on g
+        return du
+
+    def partial_ll(self, theta_or_r):
+        assert theta_or_r in ["theta", "r"]
+        if theta_or_r == "theta":
+            assert len(self.est.gs) == 1
+            if "utility" in self.est.gs:
+                #Assumes only utility for now
+                du = self.du("utility")
+                dv = self.dv_and_dEV(du, "utility") #så længe det er utility-parametre, kan denne køre på samme måde med alle parametrene (ligning 44)
+                dlnP = 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+                
+        if theta_or_r == "r":
+            du = self.du("r")
+            dv = self.dv_and_dEV(du, "r")
+            dlnP = 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
+            
+        return dlnP
+
+    def dv_and_dEV(self, du, g):
+
+        #unpack
+        P = self.sol.P
+        par = self.par
+        
+        if g is "r":
+            ndim_add = (np.newaxis, np.newaxis) #when differentiating wrt. r, there are two additional dimensions (t' and s')
+            shape_add = (par.T, par.S)
+        else:
+            ndim_add = (np.newaxis,) #all other derivatives are simply a parameter vector dimension
+            shape_add = (self.est.n_params,)
+
+        dEV = np.zeros(self.sol.EV.shape + shape_add) #her tager den alle parametrene, selvom det kun er dem i utility vi regner på nu. kommer fejl senere.
+        dv = np.zeros(P.shape + shape_add) #derivatives of choice-specific value functions
 
         #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
-        dv[:, a, ...] = dw[np.newaxis, a, ...]
+        a = par.a_max - par.a_min
+        dv[:, a, ...] = du[:, a, ...]
 
         #Next, the last age, dEV
         #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
         #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-        dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
+        dEV[:, a, :, ...] = np.sum(P[(slice(None), a, slice(None), slice(None)) + ndim_add] * dv[:, a, ...], axis=2)
 
         # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
         # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
         # with age a + 1. 
         while a > 0:
             a -= 1
-            dv[:, a, self.par.T - 1, :, :] = (dw[a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :])[np.newaxis, :, :]
+            dv[:, a, par.T - 1, ...] = du[:, a, par.T - 1, ...] + par.rho * dEV[:, a + 1, par.T - 1, ...][np.newaxis, ...]
             #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-            dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1) 
+            dEV[:, a, par.T - 1, ...] = np.sum(P[(slice(None), a, par.T - 1, slice(None)) + ndim_add] * dv[:, a, par.T - 1, ...], axis=1)
 
         #Now we can perform proper time iteration for the remaining ages.
-        t = self.par.T - 1
+        t = par.T - 1
         while t > 0:
             t -= 1
             #Choice specific value function derivatives. 
-            dv[:, :-1, t, :, :] = (dw[:-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1))[np.newaxis, ...]
-            dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
+            dv[:, :-1, t, ...] = du[:, :-1, t, ...] + par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1)[np.newaxis, ...]
+            dEV[:, :-1, t, ...] = np.sum(P[(slice(None), slice(None, -1), t, slice(None)) + ndim_add] * dv[:, :-1, t, ...], axis=2)
 
         # This concludes the calculation of the expected value function derivatives (wrt. beta0)
-        # Next, calculate the derivatives of the choice probabilities. 
-        # This is made easier by the fact that we have already calculated dv.
+        return dv
 
-        dlnP = np.zeros((P.shape) + (self.est.n_params,))
-        #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
-        dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+    def gradients(self):
+        """ Calculates analytic gradients of the log likelihood function. """
+        if self.est.partial:
+            return self.partial_ll("theta")
+        else:
+            return self.partial_ll("theta") #+ partial r * dr/dtheta
+        
+        # #Unpack
+        # # w = self.sol.w
+        # P = self.sol.P
+        # # pte = self.est.pars_to_estimate
+        # # theta_idx = self.est.theta_idx
 
-        return dlnP
+        # #Containers for results
+        # dEV = np.zeros(self.sol.EV.shape + (self.est.n_params,))
+        # # du = np.zeros(P.shape + (self.est.n_params,))
+
+        # #Assumes that only utility parameters are to be estimated FOR NOW.
+        
+        # du = self.du("utility")
+        # dv = np.zeros(P.shape + (self.est.n_params,)) #derivatives of choice-specific value functions
+
+        # #todo: VI KAN KUN ESTIMERE 1 PARAMETER LIGE NU, OG DET ER BETA0. 
+        # #beta0 og xi-parametre skal sættes sammen, da alt fra dv kan vektoriseres. Men sigma kan ikke det samme.
+        # #til sidst skal det hele så samles i en enkelt dlnP. 
+        # #JEG udvikler dette når jeg har skrevet overleaf omkring ligevægtsgradienter OG sendt dem til Bertel.
+        # # parameter = "beta0"
+        # # for parameter in pte:
+        # #Derivative of utility wrt. beta0. Calculated for all state space points once-and-for-all
+
+        # # du[..., pte[parameter], theta_idx[parameter]] = w[..., pte[parameter]] * self.par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
+
+        # a = self.par.a_max - self.par.a_min
+
+        # #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
+        # dv[:, a, ...] = du[:, a, ...]
+
+        # #Next, the last age, dEV
+        # #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
+        # #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
+        # dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
+
+        # # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
+        # # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
+        # # with age a + 1. 
+        # while a > 0:
+        #     a -= 1
+        #     dv[:, a, self.par.T - 1, :, :] = du[:, a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :][np.newaxis, :, :]
+        #     #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
+        #     dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1)
+
+        # #Now we can perform proper time iteration for the remaining ages.
+        # t = self.par.T - 1
+        # while t > 0:
+        #     t -= 1
+        #     #Choice specific value function derivatives. 
+        #     dv[:, :-1, t, :, :] = du[:, :-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1)[np.newaxis, ...]
+        #     dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
+
+        # # This concludes the calculation of the expected value function derivatives (wrt. beta0)
+        # # Next, calculate the derivatives of the choice probabilities. 
+        # # This is made easier by the fact that we have already calculated dv.
+
+        # dlnP = np.zeros((P.shape) + (self.est.n_params,)) #can be commented since it actually not used.
+        # #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
+        # dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+
+        # return dlnP
 
     def GE_humcap(self):
         res = optimize.minimize(self.objfunc_ED, 
-                                self.par.r, 
+                                self.par.r.reshape((self.par.T * self.par.S), order="F"), 
                                 method="BFGS", 
-                                jac=None,
+                                jac=self.analytic_grad_ED,
                                 tol=1e-9,
                                 options={"disp":True, "maxiter":1000})
         return res
 
-    def objfunc_ED(self, r):
-        self.par.r = r.reshape(self.par.r.shape) #Update rental prices
+    def c_ED(self):
+        return self.par.alpha1 * self.par.pY / self.par.r - np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2))) * self.par.MASS[:, np.newaxis]
+
+    def c_jacob_objfunc_ED(self, r_1d=None, ED=None):
+        """ r1_id is the collection of skill prices as a 1-D array. 
+            ED can be given directly so I avoid recomputing it."""
+        if r_1d is not None:
+            self.par.r = r_1d.reshape(self.par.r.shape, order="F")
+            self.solve_and_simulate()
+        if ED is None:
+            ED = self.c_ED()
+        dH = self.partial_ED("r")
+        #The 'times 2' enters because it is a quadratic loss function being minimized. 
+        return np.sum(2 * ED[..., np.newaxis, np.newaxis] * dH, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
+
+    def objfunc_ED(self, r_1d):
+        self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
         self.precompute_w() #With new skill prices, update wages
         self.solve_worker() #solve the worker's problem
         self.simulate()
-        #Calculate labor supply and labor demand
-        labsup = np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2))) * self.par.MASS[:, np.newaxis]
-        labdem = self.par.alpha1 * self.par.pY / self.par.r
-        objfunc = np.sum(np.square(labdem - labsup)) #sum of squared deviances (scalar function)
-        return objfunc
+        #Calculate excess labor demand
+        ED = self.c_ED()
+        objfunc = np.sum(np.square(ED)) #sum of squared excess labor demands (scalar function)
+        if self.analytic_grad_ED:
+            #Calculate jacobian of objective function (sum(ED^2)) and reshape into 1-D
+            return (objfunc, self.c_jacob_objfunc_ED(r_1d=None, ED=ED))
+        else:
+            return objfunc
 
 #%%
 
-
-gm = GM()
+gm = GM(endo_D=False, analytic_grad_ED=True)
 gm.setup(simple_statespace=False)
 gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
 gm.c_simulated_data()
-gm.l_cohorts()
-gm.l_init_distribution()
-#%%
+gm.c_D_from_data()
 gm.simulate()
+#%%
+gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
+gm.c_theta_idx()
+
+
+ED_theta = gm.partial_ED("theta")
+
+
+# x = gm.partial_ED("r")
+# y = np.load("grad_r_old.npy")
+
+
+# gm.c_theta0()
+# gm.score_from_theta(self.par.beta0[gm.est.pars_to_estimate["beta0"]])
+
+# res = gm.GE_humcap()
+
+#
+# r_1d = self.par.r.reshape((self.par.T * self.par.S), order="F")
+# new = gm.c_jacob_objfunc_ED(r_1d).copy()
+
+# r_1d *= 4
+# optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d)
+#%%
+gm.setup_sim(analytic_grad_ED=False)
+assert optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d) < 1e-7, \
+       "Differences between analytic and numeric gradients are too large"
+
+
+#%%
+
+# gm.l_cohorts()
+# gm.l_init_distribution()
 
 
 # %% Run
@@ -833,13 +1123,6 @@ gm.c_theta0()
 
 #%%
 
-method = "BFGS"
-# gm.est.options["gtol"] = 1e-8
-#Make the initial values different from the true ones before testing estimation
-gm.est.theta0 = gm.est.theta0 * np.array([0.9, 1.1])
-
-res = gm.estimate(method=method)
-res
 
 #%% Compare analytic and numeric gradients
 
@@ -848,34 +1131,3 @@ gm.est.analytic_gradients = False
 
 assert optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]]) < 1e-7, \
        "Differences between analytic and numeric gradients are too large"
-
-#%% 
-
-
-
-#%% Figur
-
-#%%
-gm.simulate()
-gm.fig_avg_wages() #wages are unchanged from this shock
-gm.fig_employment_shares(save=True)
-# gm.uncond_switching_probs()
-# print(gm.results.tables.uncond_switching_probs.to_latex())
-#%%
-
-gm = GM()
-gm.setup()
-gm.c_human_capital_unit_prices()
-gm.allocate()
-gm.precompute()
-gm.solve()
-gm.simulate()
-# gm.fig_avg_wages()
-gm.fig_employment_shares()
-
-
-#%%
-
-
-#%% Shocked system
-
