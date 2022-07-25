@@ -56,7 +56,7 @@ class GM:
             analytic_grad_ED : {True/False}. Switch between numeric jacobian and analytic jacobian for GE problem. """
 
         for k, v in kwargs.items():
-            setattr(self, k, v)
+            setattr(self.sim, k, v)
 
 
     def setup_statespace(self, simple_statespace):
@@ -84,7 +84,7 @@ class GM:
         par.N_ages = par.a_max + 1 - par.a_min
 
         #Helper object for calculating gradients of excess labor demand. Used e.g. in partial_ED 
-        self.ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)])
+        self.sim.ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)])
 
     def setup(self, simple_statespace=False, **kwargs):
         """ Initiates parameter values at their default values. Also populates meta settings. Specify named
@@ -267,9 +267,9 @@ class GM:
 
     def simulate(self):
         """ Method to simulate. This is a wrapper method that chooses between various ways of simulating from the model."""
-        if self.endo_D:
+        if self.sim.endo_D:
             self.simulate_endoD()
-        elif not self.endo_D:
+        elif not self.sim.endo_D:
             self.simulate_exoD()
 
     def simulate_exoD(self):
@@ -673,9 +673,10 @@ class GM:
     def score(self):
         """Calculate the score of the (negative of the) log likelihood. """
         #unpack
-        d = self.est.simulated_data
-        dlnP = self.gradients()
-        return - np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], :], axis=0) / len(d)
+        # d = self.est.simulated_data #make something that chooses between simulated and actual datasets somehow.
+        dll =  - self.gradients()
+        return dll
+        # return - np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], :], axis=0) / len(d)
 
     def score_from_theta(self, theta):
         """ Helper function for self.score. This makes score a function of theta so that it can be used 
@@ -724,6 +725,22 @@ class GM:
                             self.rng.choice(self.par.S, size=size, p=self.sol.P[slag, a - self.par.a_min, t, :])
         self.est.simulated_data = data.reset_index(drop=True)
 
+    def s_data(self, filename=None, simulated_data=True):
+        if simulated_data:
+            data = self.est.simulated_data
+            if filename is None:
+                filename = "simulated_data.pkl"
+            elif not filename.endswith(".pkl"):
+                filename += ".pkl"
+        #Save
+        data.to_pickle(filename)
+
+    def l_data(self, filename, simulated_data=True):
+        if not filename.endswith(".pkl"):
+            filename += ".pkl"
+        if simulated_data:
+            self.est.simulated_data = pd.read_pickle(filename)
+
     def plot_ll_3d(self, x_values, y_values):
         """ Plot the loglikelihood as a function of two parameters."""
         assert self.est.n_params == 2, "Exactly 2 parameters must be chosen for plotting."
@@ -744,9 +761,26 @@ class GM:
         ax.plot_surface(X, Y, Z, cmap ='viridis', edgecolor ='green')
         return (fig, ax)
 
-    def partial_ED(self, theta_or_r):
+    def dP(self, dv, g):
         #unpack
         P = self.sol.P
+        par = self.par
+
+        ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
+        
+        dP = P[(...,) + ndim_add]/par.sigma * (dv -  np.sum(P[(...,) + ndim_add] * dv, axis=3)[:, :, :, np.newaxis, ...])
+        #this functional form might change with sigma!
+        return dP
+
+    def dHsup(self, D, dP, g):
+        ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
+        dHsup =  self.par.MASS[(slice(None), np.newaxis) + ndim_add] * \
+                        np.sum(D[(..., np.newaxis) + ndim_add] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
+        return dHsup
+
+    def partial_ED(self, theta_or_r):
+        #unpack
+        
         D = self.est.D
         par = self.par
 
@@ -755,22 +789,25 @@ class GM:
             if "utility" in self.est.gs:
                 du = self.du("utility")
                 dv = self.dv_and_dEV(du, "utility")
-                dP =  P[..., np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
-                dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)] * \
-                        np.sum(D[(..., np.newaxis) + (np.newaxis,)] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
-
+                dP = self.dP(dv, "utility")
+                dHsup = self.dHsup(D, dP, "utility")
+                # dP =  P[..., np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
+                # dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)] * \
+                #         np.sum(D[(..., np.newaxis) + (np.newaxis,)] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
                 dH = - dHsup #parameters cannot affect demand in the model so I simply leave it out
 
         elif theta_or_r == "r":
             
-            ts_indexes = self.ts_indexes
+            ts_indexes = self.sim.ts_indexes
             
             du = self.du("r")
             dv = self.dv_and_dEV(du, "r")
+            dP = self.dP(dv, "r")
+            dHsup = self.dHsup(D, dP, "r")
 
-            dP =  P[..., np.newaxis, np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
-            dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*2] * \
-                     np.sum(D[(..., np.newaxis) + (np.newaxis,)*2] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
+            # dP =  P[..., np.newaxis, np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
+            # dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*2] * \
+            #          np.sum(D[(..., np.newaxis) + (np.newaxis,)*2] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
 
             dHdem = np.zeros((par.T, par.S, par.T, par.S))
             dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
@@ -850,7 +887,7 @@ class GM:
         if g == "r":
             #unpack
             H = self.sol.H
-            ts_indexes = self.ts_indexes
+            ts_indexes = self.sim.ts_indexes
 
             #Allocate
             du = np.zeros((par.S, par.N_ages, par.T, par.S, par.T, par.S)) #does not depend on slag when we diff wrt. r
@@ -858,13 +895,14 @@ class GM:
             #for testing, delete later:
             # du = np.arange(0, par.N_ages*par.T*par.S*par.T*par.S).reshape((par.N_ages, par.T, par.S, par.T, par.S), order="F")
              
-            # ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)]) #Object for picking combinations where st == s't'.
-            du[:, :, ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...] #H has no t-dimension (given a), and is repeated for each t.
-        
+            # ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)]) 
+            # #Object for picking combinations where st == s't'.
+            #H has no t-dimension (given a), and is repeated for each t.
+            du[:, :, ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...]  
         #note: dimensions of du vary depending on g
         return du
 
-    def partial_ll(self, theta_or_r):
+    def dlnP(self, theta_or_r):
         assert theta_or_r in ["theta", "r"]
         if theta_or_r == "theta":
             assert len(self.est.gs) == 1
@@ -926,12 +964,25 @@ class GM:
         # This concludes the calculation of the expected value function derivatives (wrt. beta0)
         return dv
 
+    def partial_ll(self, dlnP):
+        d = self.est.simulated_data
+        return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
+
     def gradients(self):
         """ Calculates analytic gradients of the log likelihood function. """
         if self.est.partial:
-            return self.partial_ll("theta")
+            return self.partial_ll(self.dlnP("theta"))
         else:
-            return self.partial_ll("theta") #+ partial r * dr/dtheta
+            T = self.par.T
+            S = self.par.S
+            #equation with label dll_dtheta in the paper
+            dED_dr_inv = np.linalg.inv(self.partial_ED("r").swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")) 
+            dr_dtheta = np.matmul(dED_dr_inv, - self.partial_ED("theta").reshape((T*S, self.est.n_params), order="F"))
+            dll_dtheta = self.partial_ll(self.dlnP("theta"))
+            dll_dr = self.partial_ll(self.dlnP("r"))
+            
+            #1-dimensional array with shape (nparams,)
+            return dll_dtheta + np.matmul(dll_dr.reshape((T*S), order="F"), dr_dtheta)
         
         # #Unpack
         # # w = self.sol.w
@@ -999,7 +1050,7 @@ class GM:
         res = optimize.minimize(self.objfunc_ED, 
                                 self.par.r.reshape((self.par.T * self.par.S), order="F"), 
                                 method="BFGS", 
-                                jac=self.analytic_grad_ED,
+                                jac=self.sim.analytic_grad_ED,
                                 tol=1e-9,
                                 options={"disp":True, "maxiter":1000})
         return res
@@ -1027,7 +1078,7 @@ class GM:
         #Calculate excess labor demand
         ED = self.c_ED()
         objfunc = np.sum(np.square(ED)) #sum of squared excess labor demands (scalar function)
-        if self.analytic_grad_ED:
+        if self.sim.analytic_grad_ED:
             #Calculate jacobian of objective function (sum(ED^2)) and reshape into 1-D
             return (objfunc, self.c_jacob_objfunc_ED(r_1d=None, ED=ED))
         else:
@@ -1035,22 +1086,128 @@ class GM:
 
 #%%
 
-gm = GM(endo_D=False, analytic_grad_ED=True)
+gm = GM(endo_D=True, analytic_grad_ED=True)
 gm.setup(simple_statespace=False)
 gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
+
+# gm.s_data(filename="simdata", simulated_data=True)
+# gm.l_data("simdata", simulated_data=True)
+
+
+# Få simuleret data i en ligevægt og se om vi kan matche gradienter i ligevægten. Lige nu passer de slet ikke. 
+gm.l_cohorts()
+gm.l_init_distribution()
+
+
+gm.simulate()
+
+gm.GE_humcap()
 gm.c_simulated_data()
 gm.c_D_from_data()
-gm.simulate()
+
 #%%
+
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
+gm.c_theta0()
 gm.c_theta_idx()
+gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=True)
+
+#%% test Loglik med GE
+
+optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
+
+g = gm.gradients()
+
+g
+
+g.shape
+
+gm.est.analytic_gradients = False
+
+gm.score_from_theta(gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
+
+# assert 
+
+optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
 
 
-ED_theta = gm.partial_ED("theta")
+#  < 1e-7, \
+#        "Differences between analytic and numeric gradients are too large"
 
+
+#%%
+dED_theta = gm.partial_ED("theta")
+dED_r = gm.partial_ED("r")
+
+gm.par.r.reshape((gm.par.T * gm.par.S), order="F")
+
+gm.par.r
+
+ED.shape
+
+ED = self.c_ED()
+ED_theta[0, 0, :]
+
+ED
+T = gm.par.T
+S = gm.par.S
+
+#order F means the first index, time, switches faster. So the first values loop through t' keeping s' fixed before switching to the next s'
+# ED.reshape((gm.par.T * gm.par.S), order="F") 
+
+#A mimicks dED_r
+# A = np.arange(0, dED_r.size).reshape((S, T, S, T), order="C").swapaxes(0, 1).swapaxes(2, 3)
+# B = A.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")
+
+# dED_dr_inv = np.linalg.inv(self.partial_ED("r").swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")) 
+dED_dr_inv = np.linalg.inv(dED_r.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
+
+# C = np.arange(dED_theta.size).reshape((T*S, self.est.n_params), order="F")
+
+# b = np.arange(36).reshape((6, 6), order="F")
+# c = np.arange(12).reshape((6, 2), order="F")
+# A = np.arange(0, dED_dr.size).reshape(dED_dr.shape, order="C")
+
+# #t, s, t', s'
+# A[0, 0, 0, 0]
+
+# dED_dr.shape 
+
+dED_theta_2d = - dED_theta.reshape((T*S, self.est.n_params), order="F")
+
+dlnP_dr = gm.dlnP("r")
+
+dr_dtheta = np.matmul(dED_dr_inv, dED_theta_2d)
+
+dr_dtheta.shape
+
+dlnP_dr.shape
+
+d = self.est.simulated_data
+# dlnP = self.gradients()
+dL_dr = - np.sum(dlnP_dr[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
+
+led2 = np.matmul(dL_dr.reshape((T*S), order="F"), dr_dtheta)
+dL_dtheta = np.sum(gm.dlnP("theta")[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
+
+dL_dtheta + led2
+
+
+
+led2.shape
+
+dED_dr_inv.shape
+dED_theta_2d.shape
+
+dED_theta[0, 0, 0]
+dED_theta[1, 0, 0]
+dED_theta_2d[0, 0]
+dED_theta_2d[1, 0]
+
+dED_dr_inv.shape
 
 # x = gm.partial_ED("r")
 # y = np.load("grad_r_old.npy")
@@ -1062,21 +1219,19 @@ ED_theta = gm.partial_ED("theta")
 # res = gm.GE_humcap()
 
 #
-# r_1d = self.par.r.reshape((self.par.T * self.par.S), order="F")
+# 
 # new = gm.c_jacob_objfunc_ED(r_1d).copy()
 
 # r_1d *= 4
 # optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d)
 #%%
 gm.setup_sim(analytic_grad_ED=False)
+r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F")
 assert optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d) < 1e-7, \
        "Differences between analytic and numeric gradients are too large"
 
-
 #%%
 
-# gm.l_cohorts()
-# gm.l_init_distribution()
 
 
 # %% Run
@@ -1106,7 +1261,7 @@ res
 #%%
 
 #%%
-gm.c_simulated_data(n_individuals=50_000)
+# gm.c_simulated_data(n_individuals=50_000)
 gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
 gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
 gm.c_theta_idx()
