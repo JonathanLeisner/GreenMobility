@@ -762,6 +762,9 @@ class GM:
         return (fig, ax)
 
     def dP(self, dv, g):
+        """ Calculates dP with respect to either r or parameters, controlled by the input variable g. 
+            dv must also be provided.
+        """
         #unpack
         P = self.sol.P
         par = self.par
@@ -773,14 +776,22 @@ class GM:
         return dP
 
     def dHsup(self, D, dP, g):
+        """ Calculate the partial derivative of human capital suppyly with respect to either skill prices or theta. 
+            The input g controls this. 
+            Expressions for D and dP must be supplied as well. Implicitly, this function assumes that D is constant and so D' can be ignored.
+        """
         ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
         dHsup =  self.par.MASS[(slice(None), np.newaxis) + ndim_add] * \
                         np.sum(D[(..., np.newaxis) + ndim_add] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
         return dHsup
 
     def partial_ED(self, theta_or_r):
+        """ Calculate the partial derivative of the excess labor demand functions (S x T of these) with respect to either theta or r.
+            This partial derivative is used to find the equilibrium on the labor market but also to calculate the derivative dll/dtheta 
+            when the model is not partial.
+        """
+
         #unpack
-        
         D = self.est.D
         par = self.par
 
@@ -815,57 +826,10 @@ class GM:
             dH = dHdem - dHsup
         return dH
 
-    # def grad_ED_r(self):
-    #     """Calculate analytic gradients of the excess demand functions with respect to skill prices. """
-    #     H = self.sol.H
-    #     P = self.sol.P
-    #     par = self.par
-    #     ndim_r = 2
-    #     D = self.est.D
-    #     dEV = np.zeros(self.sol.EV.shape + (par.T, par.S))
-    #     dv = np.zeros(P.shape + (par.T, par.S))
-
-    #     du = np.zeros((par.S, par.N_ages, par.T, par.S, par.T, par.S)) #does not depend on slag when we diff wrt. r
-    #     # du = np.arange(0, par.N_ages*par.T*par.S*par.T*par.S).reshape((par.N_ages, par.T, par.S, par.T, par.S), order="F")
-
-    #     #Calculates du once-and-for-all 
-    #     idx_arr = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)]) #Object for picking combinations where st == s't'.
-    #     du[:, :, idx_arr[:, 0], idx_arr[:, 1], idx_arr[:, 0], idx_arr[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...] #H has no t-dimension (given a), and is repeated for each t.
-
-    #     a = self.par.a_max - self.par.a_min
-    #     dv[:, a, ...] = du[:, a, ...]
-
-    #     #Next, the last age, dEV
-    #     #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
-    #     #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-    #     dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis, np.newaxis] * dv[:, a, ...], axis=2)
-    #     while a > 0:
-    #         a -= 1
-    #         dv[:, a, self.par.T - 1, ...] = du[:, a, self.par.T - 1, ...] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :][np.newaxis, ...]
-    #         #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-    #         dEV[:, a, self.par.T - 1, ...] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis, np.newaxis] * dv[:, a, self.par.T - 1, ...], axis=1)
-
-    #     t = self.par.T - 1
-    #     while t > 0:
-    #         t -= 1
-    #         #Choice specific value function derivatives. 
-    #         dv[:, :-1, t, ...] = du[:, :-1, t, ...] + self.par.rho * dEV[:, 1:, t + 1, ...].swapaxes(0, 1)[np.newaxis, ...]
-    #         #not necessary to c this when t = 0 actually, the continuation value in the initial period enters nowhere.
-    #         dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis, np.newaxis] * dv[:, :-1, t, ...], axis=2)
-
-    #     # dP = np.zeros((P.shape) + (par.T, par.S))
-    #     #dP has shape (slag, a, t, s, t', s')
-    #     dP =  P[..., np.newaxis, np.newaxis]/self.par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
-    #     dHsup =  gm.par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*ndim_r] * \
-    #         np.sum(D[(..., np.newaxis) + (np.newaxis,)*ndim_r] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
-
-    #     dHdem = np.zeros((par.T, par.S, par.T, par.S))
-    #     dHdem[idx_arr[:, 0], idx_arr[:, 1], idx_arr[:, 0], idx_arr[:, 1]] = np.reshape(gm.par.alpha1 * gm.par.pY / (- np.square(gm.par.r)), (par.T*par.S), order="F")
-
-    #     dH = dHdem - dHsup
-    #     return dH
-
     def du(self, g):
+        """ Calculates du with respect to some group of parameters, e.g. utility parameters, sigma or r. This choice determines the functional form
+            implicitly (or if you look in the code actually, explicitly) used to calculate du. """
+
         #I make it such that du always has the same dimension for a given parameter type (r or actual parameter).
         # assert g in ["utility", "sigma", "price"]. g refers to parameter type groups.
 
@@ -903,6 +867,9 @@ class GM:
         return du
 
     def dlnP(self, theta_or_r):
+        """ Calculates dlnP with respect to either the parameter vector (theta) or skill prices (r). The choice of this determined by the argument
+            theta_or_r. The function calculates du, and from this dv, and then finally dlnP from dv. 
+        """
         assert theta_or_r in ["theta", "r"]
         if theta_or_r == "theta":
             assert len(self.est.gs) == 1
@@ -920,6 +887,11 @@ class GM:
         return dlnP
 
     def dv_and_dEV(self, du, g):
+        """ Calculates dv and dEV from du. g specifies whether the derivative is with respect to r or parameters, since this determines whether we have
+            to add two dimensions or one (since r is defined over s and t while parameters are collected in one dimension). 
+            The function only returns dv since dEV is never necessary to know on its own if we know dv.
+            The calculation of derivatives follows the same backwards recursion structure as the solution to the worker's problem.
+        """
 
         #unpack
         P = self.sol.P
@@ -965,11 +937,16 @@ class GM:
         return dv
 
     def partial_ll(self, dlnP):
+        """ The partial derivative of the log likelihood can be calculated from dlnP/dtheta which is the input to this function. 
+            To calculate this derivative, dlnP is evaluated in all the data points from the estimation sample. 
+        """
         d = self.est.simulated_data
         return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
 
     def gradients(self):
-        """ Calculates analytic gradients of the log likelihood function. """
+        """ Calculates analytic gradients of the log likelihood function. 
+            When the model is solves in partial mode, this assumes dr/dtheta = 0 and so only the partial effect dll/dtheta remains.
+        """
         if self.est.partial:
             return self.partial_ll(self.dlnP("theta"))
         else:
@@ -1047,6 +1024,10 @@ class GM:
         # return dlnP
 
     def GE_humcap(self):
+        """ This function minimizes the objective function of the labor market equilibrium to find equilibrium skill prices. 
+            Initial values for the skill prices are the ones currently stored in par.r. 
+            Uses analytic gradients when self.sim.analytic_grad_ED is True.
+        """
         res = optimize.minimize(self.objfunc_ED, 
                                 self.par.r.reshape((self.par.T * self.par.S), order="F"), 
                                 method="BFGS", 
@@ -1056,7 +1037,9 @@ class GM:
         return res
 
     def c_ED(self):
-        return self.par.alpha1 * self.par.pY / self.par.r - np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2))) * self.par.MASS[:, np.newaxis]
+        """ Calculates excess demand from the currently stored simulation density. """
+        return self.par.alpha1 * self.par.pY / self.par.r - \
+               np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2))) * self.par.MASS[:, np.newaxis]
 
     def c_jacob_objfunc_ED(self, r_1d=None, ED=None):
         """ r1_id is the collection of skill prices as a 1-D array. 
@@ -1071,6 +1054,12 @@ class GM:
         return np.sum(2 * ED[..., np.newaxis, np.newaxis] * dH, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
 
     def objfunc_ED(self, r_1d):
+        """ Evaluates the objective function for finding the equilibrium on the labor market. 
+            The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
+            that the first entries vary the year and keep the sector fixed. 
+            The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
+            The function also return analytic gradients when self.sim.analytic_grad_ED is True.
+            """
         self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
         self.precompute_w() #With new skill prices, update wages
         self.solve_worker() #solve the worker's problem
@@ -1085,6 +1074,12 @@ class GM:
             return objfunc
 
 #%%
+self = gm
+self.par.r.reshape((self.par.T * self.par.S), order="F")
+
+
+
+r_1d.reshape(self.par.r.shape, order="F")
 
 gm = GM(endo_D=True, analytic_grad_ED=True)
 gm.setup(simple_statespace=False)
@@ -1121,10 +1116,6 @@ optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_t
 
 g = gm.gradients()
 
-g
-
-g.shape
-
 gm.est.analytic_gradients = False
 
 gm.score_from_theta(gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
@@ -1144,16 +1135,6 @@ dED_r = gm.partial_ED("r")
 
 gm.par.r.reshape((gm.par.T * gm.par.S), order="F")
 
-gm.par.r
-
-ED.shape
-
-ED = self.c_ED()
-ED_theta[0, 0, :]
-
-ED
-T = gm.par.T
-S = gm.par.S
 
 #order F means the first index, time, switches faster. So the first values loop through t' keeping s' fixed before switching to the next s'
 # ED.reshape((gm.par.T * gm.par.S), order="F") 
@@ -1163,7 +1144,7 @@ S = gm.par.S
 # B = A.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")
 
 # dED_dr_inv = np.linalg.inv(self.partial_ED("r").swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")) 
-dED_dr_inv = np.linalg.inv(dED_r.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
+# dED_dr_inv = np.linalg.inv(dED_r.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
 
 # C = np.arange(dED_theta.size).reshape((T*S, self.est.n_params), order="F")
 
@@ -1197,17 +1178,17 @@ dL_dtheta + led2
 
 
 
-led2.shape
+# led2.shape
 
-dED_dr_inv.shape
-dED_theta_2d.shape
+# dED_dr_inv.shape
+# dED_theta_2d.shape
 
-dED_theta[0, 0, 0]
-dED_theta[1, 0, 0]
-dED_theta_2d[0, 0]
-dED_theta_2d[1, 0]
+# dED_theta[0, 0, 0]
+# dED_theta[1, 0, 0]
+# dED_theta_2d[0, 0]
+# dED_theta_2d[1, 0]
 
-dED_dr_inv.shape
+# dED_dr_inv.shape
 
 # x = gm.partial_ED("r")
 # y = np.load("grad_r_old.npy")
