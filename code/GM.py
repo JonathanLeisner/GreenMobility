@@ -254,6 +254,11 @@ class GM:
             (EV[:, :-1, t], P[:, :-1, t, :]) = self.closed_forms(par.sigma, V_alternatives)
 
     def c_D_from_data(self, simulated_data=True):
+        """ Calculates the variable D in the paper. The variable is defined over all state space points (Omega), 
+            and measures how large a fraction of individuals are characterized by that state space point. 
+            The variable sums to one within each time period by construction.
+            When using this method with simulated data, c_simulated_data must be run first.
+        """
         if simulated_data:
             d = gm.est.simulated_data
         else:
@@ -475,8 +480,8 @@ class GM:
         """ Constructs an ordered dictionary where keys are parameter names
             and each value is an array of indexes. This indexes the parameter itself in self.par. 
             These two are controlled using the optional arguments 'parameters' and 'indexes'. 
-            'indexes' should be either an array (if all parameters to be estimated belong to the same
-            attribute in par. If parameters from multiple attributes are to be estimated, 'indexes' 
+            'indexes' should be either (1): an array (if all parameters to be estimated belong to the same
+            attribute in par, or (2): if parameters from multiple attributes are to be estimated, 'indexes' 
             should be a list. The list can contain either arrays or None values. The value None implies that all
             parameters in the attribute will be estimated. """
         pars_to_estimate = OrderedDict()
@@ -646,7 +651,7 @@ class GM:
         self.solve_worker()
         if not self.est.partial:
             # self.solve_humancap_equilibrium()
-            self.GE_humcap()
+            self.find_humcap_equilibrium()
         self.simulate()
 
     def obj_func(self, theta):
@@ -691,7 +696,10 @@ class GM:
         """ Simulate data from the model currently stored. We simulate N = 'n_individuals' individuals. 
             The total number of observations (NxT) is random because we simulate individuals of all ages.
             This means that some people only enter the sample 1 year because that is the year they turn 30.
-            Other individuals only enter the sample in 3 years because they start at the age of 63. """
+            Other individuals only enter the sample in 3 years because they start at the age of 63. 
+            To run this method, the worker's problem must already have been solved. It simulates data given
+            the current parameter and skill price values stored implicitly in the choice probabilities (self.sol.P). 
+        """
         self.rng = default_rng(123456)
         data = pd.DataFrame(-1, 
                             index=pd.MultiIndex.from_product([range(0, n_individuals), range(self.par.T)], names=["i", "t"]), 
@@ -790,7 +798,6 @@ class GM:
             This partial derivative is used to find the equilibrium on the labor market but also to calculate the derivative dll/dtheta 
             when the model is not partial.
         """
-
         #unpack
         D = self.est.D
         par = self.par
@@ -805,7 +812,7 @@ class GM:
                 # dP =  P[..., np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
                 # dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)] * \
                 #         np.sum(D[(..., np.newaxis) + (np.newaxis,)] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
-                dH = - dHsup #parameters cannot affect demand in the model so I simply leave it out
+                dED = - dHsup #parameters cannot affect demand in the model so I simply leave it out
 
         elif theta_or_r == "r":
             
@@ -823,8 +830,8 @@ class GM:
             dHdem = np.zeros((par.T, par.S, par.T, par.S))
             dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
 
-            dH = dHdem - dHsup
-        return dH
+            dED = dHdem - dHsup
+        return dED
 
     def du(self, g):
         """ Calculates du with respect to some group of parameters, e.g. utility parameters, sigma or r. This choice determines the functional form
@@ -1032,7 +1039,7 @@ class GM:
                                 self.par.r.reshape((self.par.T * self.par.S), order="F"), 
                                 method="BFGS", 
                                 jac=self.sim.analytic_grad_ED,
-                                tol=1e-9,
+                                tol=1e-7,
                                 options={"disp":True, "maxiter":1000})
         return res
 
@@ -1049,9 +1056,52 @@ class GM:
             self.solve_and_simulate()
         if ED is None:
             ED = self.c_ED()
-        dH = self.partial_ED("r")
-        #The 'times 2' enters because it is a quadratic loss function being minimized. 
-        return np.sum(2 * ED[..., np.newaxis, np.newaxis] * dH, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
+        dED = self.partial_ED("r")
+        #The 'ED / abs(ED)' enters to flip the sign of derivatives where ED < 0. What if ED is zero here? Could cause issues.
+        # return np.sum(((ED < 0) * (-1) + (ED > 0) * 1)[..., np.newaxis, np.newaxis] * dED, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
+        # return np.sum((ED/np.abs(ED))[..., np.newaxis, np.newaxis] * dED, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
+        return np.sum(2 * ED[..., np.newaxis, np.newaxis] * dED, axis=(0, 1)).reshape((self.par.T * self.par.S), order="F")
+
+    def c_jac_innerED(self, r=None):
+        if (r is not None):
+            if r.ndim == 1:
+                self.par.r = r.reshape(self.par.r.shape, order="F")
+            elif r.ndim == 2:
+                self.par.r = r
+            self.solve_and_simulate()
+        dED = self.partial_ED("r")
+        # if r.ndim == 1:
+            # return dED.reshape((self.par.T * self.par.S), order="F")
+        # else:
+        return dED
+
+    def solve_ED(self, r_1d):
+        """ Evaluates the objective function for finding the equilibrium on the labor market. 
+            The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
+            that the first entries vary the year and keep the sector fixed. 
+            The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
+            The function also return analytic gradients when self.sim.analytic_grad_ED is True.
+            """
+        self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
+        self.precompute_w() #With new skill prices, update wages
+        self.solve_worker() #solve the worker's problem
+        self.simulate()
+        #Calculate excess labor demand
+        ED = self.c_ED()
+        return ED.reshape((self.par.T * self.par.S), order="F")
+
+    def GE_humcap2(self):
+        initvals = self.par.r.reshape((self.par.T * self.par.S), order="F").copy()
+        (x, infodict, ier, mesg) = optimize.fsolve(self.solve_ED, initvals, full_output=True)
+        #todo: Use inner gradients here to make solver faster!!! 
+        assert ier == 1, "Solving for equilibrium not successful."
+        #For some reason, we have to replace r with the solution here
+        self.par.r = x.reshape(self.par.r.shape, order="F")
+        return (x, infodict, ier, mesg)
+
+    def find_humcap_equilibrium(self):
+        self.GE_humcap() #Solve using quadratic deviances.
+        self.GE_humcap2() #Solve by settings ED=0 in equation system.
 
     def objfunc_ED(self, r_1d):
         """ Evaluates the objective function for finding the equilibrium on the labor market. 
@@ -1066,20 +1116,62 @@ class GM:
         self.simulate()
         #Calculate excess labor demand
         ED = self.c_ED()
-        objfunc = np.sum(np.square(ED)) #sum of squared excess labor demands (scalar function)
+        # objfunc = np.sum(np.abs(ED)) #sum of absolute excess labor demands (scalar function)
+        objfunc = np.sum(np.square(ED))
         if self.sim.analytic_grad_ED:
             #Calculate jacobian of objective function (sum(ED^2)) and reshape into 1-D
             return (objfunc, self.c_jacob_objfunc_ED(r_1d=None, ED=ED))
         else:
             return objfunc
 
+
+
+#%% Various functions
+
+def check_grad(x0, f, jac, args_f=[], kwargs_jac={}):
+    approx_fprime = optimize.approx_fprime(x0, f, 1.4901161193847656e-08, *args_f)
+    err = approx_fprime - jac(x0, **kwargs_jac)
+    return np.sqrt(np.sum(np.square(err)))
+
+def get_grad_from_vector(x, fun, index):
+    fvals = fun(x)
+    return fvals[index]
+
 #%%
-self = gm
-self.par.r.reshape((self.par.T * self.par.S), order="F")
+
+# def func(r_1d):
+#     gm.par.r = r_1d.reshape(gm.par.r.shape, order="F")
+#     gm.precompute_w()
+#     gm.solve_worker()
+#     gm.simulate()
+#     ED = gm.c_ED()
+#     return ED.reshape((gm.par.T * gm.par.S), order="F")
+
+# func(gm.par.r.reshape((gm.par.T * gm.par.S), order="F"))
+
+# (x, infodict, ier, mesg) = optimize.fsolve(func, gm.par.r.reshape((gm.par.T * gm.par.S), order="F"), full_output=True)
+
+# gm.par.r
+
+# def solve_ED(self, r_1d):
+# """ Evaluates the objective function for finding the equilibrium on the labor market. 
+#     The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
+#     that the first entries vary the year and keep the sector fixed. 
+#     The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
+#     The function also return analytic gradients when self.sim.analytic_grad_ED is True.
+#     """
+# self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
+# self.precompute_w() #With new skill prices, update wages
+# self.solve_worker() #solve the worker's problem
+# self.simulate()
+# #Calculate excess labor demand
+# ED = self.c_ED()
 
 
-
-r_1d.reshape(self.par.r.shape, order="F")
+#Test af gradienter: 
+# 1. Analytisk ll i partiel model
+# 2. Analytisk for indre loop (ligevægt mht. r)
+# 3. Analytisk ll for GE model.
 
 gm = GM(endo_D=True, analytic_grad_ED=True)
 gm.setup(simple_statespace=False)
@@ -1087,21 +1179,84 @@ gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
-
-# gm.s_data(filename="simdata", simulated_data=True)
-# gm.l_data("simdata", simulated_data=True)
-
-
-# Få simuleret data i en ligevægt og se om vi kan matche gradienter i ligevægten. Lige nu passer de slet ikke. 
-gm.l_cohorts()
-gm.l_init_distribution()
-
-
-gm.simulate()
-
-gm.GE_humcap()
 gm.c_simulated_data()
+gm.l_init_distribution()
+gm.l_cohorts()
 gm.c_D_from_data()
+gm.simulate()
+gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
+gm.c_theta_idx()
+gm.c_theta0()
+gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=False)
+# 1. Partial:
+initvals = gm.est.theta0.copy()
+assert optimize.check_grad(gm.obj_func, gm.score_from_theta, initvals) < 1e-8
+# 2. Technically still in partial mode, ED wrt. r gradients
+gm.setup_sim(analytic_grad_ED=False)
+r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F").copy()
+assert optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d) < 1e-6, \
+       "Differences between analytic and numeric gradients are too large"
+
+
+#%% Find equilibrium before simulating new data where r is in equilibrium
+
+gm = GM(endo_D=True, analytic_grad_ED=False)
+gm.setup(simple_statespace=False)
+gm.c_human_capital_unit_prices()
+gm.allocate()
+gm.precompute()
+gm.solve_worker()
+gm.c_simulated_data()
+gm.l_init_distribution()
+gm.l_cohorts()
+#gm.c_D_from_data()
+gm.simulate()
+gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=True)
+gm.GE_humcap() #find equilibrium without using analytic gradients.
+#Simulate new data using the current skill prices, which are in equilibrium.
+gm.c_simulated_data()
+gm.setup_sim(endo_D=False)
+gm.c_D_from_data()
+gm.setup_sim(analytic_grad_ED=True)
+#Find equilibrium while using gradients to check that it works.
+res = gm.GE_humcap()
+# Find equilibrium skill prices using fsolve:
+(x, infodict, ier, mesg) = gm.GE_humcap2()
+gm.setup_sim(analytic_grad_ED=False)
+r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F").copy()
+
+# gm.objfunc_ED(r_1d)
+# np.sqrt(np.sum(np.square(optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08, gm.objfunc_ED, 0) - gm.c_jacob_objfunc_ED(r_1d))))
+# optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08, gm.objfunc_ED, 0)
+# optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08)
+
+#Outer equilibrium loop gradient check
+args_f = [gm.objfunc_ED]
+g = lambda x: gm.c_jacob_objfunc_ED(x).reshape((gm.par.T * gm.par.S), order="F")
+assert check_grad(r_1d, gm.objfunc_ED, g) < 1e-7
+
+#Inner equilibrium loop gradient check
+#HER SKAL LAVES LOOP SÅ ALLE GRADIENTER CHECKES.
+args_f = [gm.solve_ED, 1]
+g = lambda x: gm.c_jac_innerED(x)[1, 0, :, :].reshape((gm.par.T * gm.par.S), order="F")
+assert check_grad(r_1d, get_grad_from_vector, g, args_f=args_f) < 1e-7, "Inner solver gradient wrong"
+
+#Loglik gradient check in general equilibrium
+gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
+gm.c_theta_idx()
+gm.c_theta0()
+gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=False)
+
+theta0 = gm.est.theta0.copy() 
+res = optimize.approx_fprime(theta0, gm.obj_func, 1.4901161193847656e-08)
+gm.score_from_theta(theta0)
+assert check_grad(theta0, gm.obj_func, gm.score_from_theta) < 1e-7, "Loglikelihood works"
+
+
+#Ja de her dummies skal lige rettes til. Og så er der noget omkring hvilke gradienter der bruges hvor.
+# mangler stadig gradienter i solve_ED.
+#navnene til alt det der ED skal også fixes.
+#Er partial ikke mere en generel setting end en estimationsting? joo.
 
 #%%
 
