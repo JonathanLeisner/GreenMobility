@@ -1,6 +1,8 @@
 """  Defines the class that runs the Green Mobility (GM) project code."""
 #%%
 
+from operator import index
+from turtle import update
 from types import SimpleNamespace
 from collections import OrderedDict
 import numpy as np
@@ -15,8 +17,11 @@ np.set_printoptions(precision=3)
 sns.set_theme()
 import warnings
 warnings.filterwarnings("error", category=RuntimeWarning)
+import pyfuncs as pyf
 
-
+def update_attrs(ns, **kwargs):
+    for k, v in kwargs.items():
+        setattr(ns, k, v)
 
 #%%
 
@@ -24,7 +29,7 @@ class GM:
     """ Class to solve the model presented in Leisner (2023). 
         Generally, the notation c_[name] for methods means construct/create/calculate an object or attribute called [name].
     """
-    def __init__(self, name = None, endo_D=True, analytic_grad_quadED=True):
+    def __init__(self, name = None, endo_D=True, agrad_quadED=True):
         self.sol = SimpleNamespace()
         self.par = SimpleNamespace()
         self.par.scale = SimpleNamespace() #collects scalar scales for all parameters.
@@ -45,18 +50,22 @@ class GM:
         self.version = "v3"
         self.rng = default_rng(123456) #seed
 
+        self.partial_model = False
+        self.agrad_ED0 = True
+        self.agrad_quadED = True
+
         self.est.default_method = "BFGS"
-        self.est.partial = True
-        self.setup_sim(endo_D=endo_D, analytic_grad_quadED=analytic_grad_quadED)
+        update_attrs(self.sim, endo_D=endo_D)
+        # self.setup_sim(endo_D=endo_D)
 
-    def setup_sim(self, **kwargs):
-        """ Sets up settings needed to simulate. 
-            The keywords that can be used are:
-            endo_D : {True/False}. Switching between endogenous and exogenous D (density).
-            analytic_grad_quadED : {True/False}. Switch between numeric jacobian and analytic jacobian for outer GE problem. """
+    # def setup_sim(self, **kwargs):
+    #     """ Sets up settings needed to simulate. 
+    #         The keywords that can be used are:
+    #         endo_D : {True/False}. Switching between endogenous and exogenous D (density).
+    #         agrad_quadED : {True/False}. Switch between numeric jacobian and analytic jacobian for outer GE problem. """
 
-        for k, v in kwargs.items():
-            setattr(self.sim, k, v)
+    #     for k, v in kwargs.items():
+    #         setattr(self.sim, k, v)
 
 
     def setup_statespace(self, simple_statespace):
@@ -118,8 +127,6 @@ class GM:
         #Gumbel shock scale parameter
         par.sigma = 0.8
 
-        
-
         #Human capital function parameters
         # par.beta0 = np.array([0.002, 0.006, 0.012, 0.008])[:par.S] #1-dimensional over sectors. 
         par.beta0 = np.array([0.2, 0.6, 1.2, 0.8])[:par.S] #1-dimensional over sectors. 
@@ -145,6 +152,9 @@ class GM:
         #Post-setup stuff (e.g. calculating M based on xi-parameters)
         self.c_switching_cost_matrix()
 
+        #Initial values for skill prices (r)
+        par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=0)
+
         self.diag.tables.skillprice_converge = \
             pd.DataFrame(np.nan, 
                          index=pd.MultiIndex.from_product([self.par.sector_names, range(self.par.T)], 
@@ -161,13 +171,13 @@ class GM:
         par.M = np.exp(par.M)
         np.fill_diagonal(par.M, 0) #Not switching sector is costless
 
-    def c_human_capital_unit_prices(self):
-        """ Human capital unit prices, the symbol r in the paper. This is just an initial value. 
-            This variable is endogenously determined in equilibrium (when self.est.partial == False). 
-        """
-        par = self.par
-        # SxT
-        par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=0)
+    # def c_human_capital_unit_prices(self):
+    #     """ Human capital unit prices, the symbol r in the paper. This is just an initial value. 
+    #         This variable is endogenously determined in equilibrium (when self.partial_model == False). 
+    #     """
+    #     par = self.par
+    #     # SxT
+    #     par.r = np.linspace(np.arange(1, par.S+1), np.arange(1, par.S+1)[::-1], par.T, axis=0)
 
     def load_MASS(self, version="constant"):
         """ Creates a time series of MASS."""
@@ -591,27 +601,26 @@ class GM:
                 setattr(par, key, theta[n]) #new value is set
                 n += 1
 
-    def setup_estimation(self, partial=False, method=None, analytic_gradients=None):
+    def setup_estimation(self, parameters=None, indexes=None, method=None, agrad_loglik=True):
         """ This method controls a few different options for estimation.
             'partial' controls whether skill prices are kept fixed or endogenously determined in equilibrium.
             'method' controls the optimization algorithm. Common choice is 'BFGS'. 
-            'analytic_gradients' controls whether to use numeric approximations for gradients or 
+            'agrad_loglik' controls whether to use numeric approximations for gradients or 
             the analytic gradients. """
+        self.c_pars_to_estimate(parameters=parameters, indexes=indexes)
+        self.c_theta_idx()
+        self.c_theta0()
         if method is None:
             method = self.est.default_method
         self.c_est_options(method)
-        #Fix skill prices arbitrarily, or by equilibrium conditions
-        if partial:
-            self.est.partial = True
-        else:
-            self.est.partial = False
-        self.est.analytic_gradients = analytic_gradients
+        self.est.agrad_loglik = agrad_loglik
+        self.est.loglik_scale = len(self.est.simulated_data)
 
     def c_est_options(self, method):
         """Constructs a dictionary given to scipy.optimize.minimize when estimating. """
-        options = {"disp":True, "maxiter":1000}
+        options = {"disp":False, "maxiter":1000}
         if method == "BFGS":
-            options["gtol"] = 1e-10
+            options["gtol"] = 1e-7
         self.est.options = options
 
     @staticmethod
@@ -621,7 +630,7 @@ class GM:
         if method == "Nelder-Mead":
             return 1e-10
         else:
-            return 1e-10
+            return 1e-9
 
     def estimate(self, method=None):
         """ Estimate the parameters stored in self.est.pars_to_estimate. 
@@ -635,12 +644,12 @@ class GM:
         self.update_par(self.par, theta0, pte)
         self.c_switching_cost_matrix()
 
-        print(f'objective function at starting values: {self.obj_func(theta0)}')
+        print(f'objective function at starting values: {self.ll_objfunc(theta0)}')
 
-        res = optimize.minimize(self.obj_func, 
+        res = optimize.minimize(self.ll_objfunc, 
                                 theta0, 
                                 method=method, 
-                                jac=self.est.analytic_gradients, 
+                                jac=self.est.agrad_loglik, 
                                 tol=self.est_ftol(method), 
                                 options=self.est.options)
         return res
@@ -649,16 +658,16 @@ class GM:
         """ Runs the methods necessary to solve and simulate the model given parameters. """
         # self.precompute() #H changes with parameters and so needs to be precomputed again.
         self.solve_worker()
-        if not self.est.partial:
+        if not self.partial_model:
             # self.solve_humancap_equilibrium()
             self.find_humcap_equilibrium()
         self.simulate()
 
-    def obj_func(self, theta):
+    def ll_objfunc(self, theta):
         """ Update parameters, calculate equilibrium and evaluate loglik. If partial = True, 
             the skill prices (r) are kept fixed, and hence the human capital equilibrium conditions 
             are ignored. """
-        print(theta)
+        # print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
         self.precompute()
         self.solve_and_simulate()
@@ -667,14 +676,14 @@ class GM:
         d = self.est.simulated_data
         P = self.sol.P
         ll = self.loglik(d, P)
-        if self.est.analytic_gradients:
+        if self.est.agrad_loglik:
             return (ll, self.score())
         else:
             return ll
 
     def loglik(self, d, P):
         """Calculate the (negative of the) log likelihood for a sample d with choice probabilities c"""
-        return - np.sum(np.log(P[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"]])) / len(d)
+        return - np.sum(np.log(P[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"]])) / self.est.loglik_scale
 
     def score(self):
         """Calculate the score of the (negative of the) log likelihood. """
@@ -746,14 +755,14 @@ class GM:
             elif not filename.endswith(".pkl"):
                 filename += ".pkl"
         #Save
-        data.to_pickle(filename)
+        data.to_pickle("../data/" + filename)
 
     def l_data(self, filename, simulated_data=True):
         """ Load a dataset stored as a .pkl file. """
         if not filename.endswith(".pkl"):
             filename += ".pkl"
         if simulated_data:
-            self.est.simulated_data = pd.read_pickle(filename)
+            self.est.simulated_data = pd.read_pickle("../data/" + filename)
         else:
             raise Exception()
 
@@ -766,7 +775,7 @@ class GM:
         n = 0
         for xval in x_values:
             for yval in y_values:
-                z[n] = self.obj_func(theta = np.array([xval, yval]))
+                z[n] = self.ll_objfunc(theta = np.array([xval, yval]))
                 n += 1
 
         X, Y = np.meshgrid(x_values, y_values)
@@ -792,7 +801,7 @@ class GM:
         return dP
 
     def dHsup(self, D, dP, g):
-        """ Calculate the partial derivative of human capital suppyly with respect to either skill prices or theta. 
+        """ Calculate the partial derivative of human capital supply with respect to either skill prices or theta. 
             The input g controls this. 
             Expressions for D and dP must be supplied as well. Implicitly, this function assumes that D is constant and so D' can be ignored.
         """
@@ -956,13 +965,13 @@ class GM:
             To calculate this derivative, dlnP is evaluated in all the data points from the estimation sample. 
         """
         d = self.est.simulated_data
-        return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
+        return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / self.est.loglik_scale
 
     def gradients(self):
         """ Calculates analytic gradients of the log likelihood function. 
-            When the model is solves in partial mode, this assumes dr/dtheta = 0 and so only the partial effect dll/dtheta remains.
+            When the model is solved in partial mode, this assumes dr/dtheta = 0 and so only the partial effect dll/dtheta remains.
         """
-        if self.est.partial:
+        if self.partial_model:
             return self.partial_ll(self.dlnP("theta"))
         else:
             T = self.par.T
@@ -1041,14 +1050,14 @@ class GM:
     def minimize_quadED(self):
         """ This function minimizes the objective function of the labor market equilibrium to find equilibrium skill prices. 
             Initial values for the skill prices are the ones currently stored in par.r. 
-            Uses analytic gradients when self.sim.analytic_grad_quadED is True.
+            Uses analytic gradients when self.agrad_quadED is True.
         """
         res = optimize.minimize(self.quadED, 
                                 self.par.r.reshape((self.par.T * self.par.S), order="F"), 
                                 method="BFGS", 
-                                jac=self.sim.analytic_grad_quadED,
+                                jac=self.agrad_quadED,
                                 tol=1e-7,
-                                options={"disp":True, "maxiter":1000})
+                                options={"disp":False, "maxiter":1000, "gtol":1e-5})
         return res
 
     def c_ED(self):
@@ -1069,6 +1078,7 @@ class GM:
             self.precompute_w()
             self.solve_worker()
             self.simulate()
+            
         return self.partial_ED("r")
 
     def c_jac_quadED(self, r=None, ED=None):
@@ -1105,7 +1115,7 @@ class GM:
             The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
             that the first entries vary the year and keep the sector fixed. 
             The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
-            The function also return analytic gradients when self.sim.analytic_grad_quadED is True.
+            The function also return analytic gradients when self.agrad_quadED is True.
             REWRITE THIS DOCSTRING.
         """
         self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
@@ -1119,8 +1129,12 @@ class GM:
     def solve_ED0(self):
         """ Solve the equation system ED = 0. The initial value for r is that stored in .par currently."""
         initvals = self.par.r.reshape((self.par.T * self.par.S), order="F").copy()
-        (x, infodict, ier, mesg) = optimize.fsolve(self.ED_from_r, initvals, full_output=True)
-        #todo: Use inner gradients here to make solver faster!!! 
+        if self.agrad_ED0:
+            fprime = lambda x: self.dED_dr(x).swapaxes(0, 1).swapaxes(2, 3).reshape((self.par.T*self.par.S, 
+                                                                                     self.par.T*self.par.S), order="C")
+        else:
+            fprime = None
+        (x, infodict, ier, mesg) = optimize.fsolve(self.ED_from_r, initvals, fprime=fprime, full_output=True)
         assert ier == 1, "Solving for equilibrium not successful."
         #Replace r with the solution.
         self.par.r = x.reshape(self.par.r.shape, order="F")
@@ -1128,7 +1142,7 @@ class GM:
 
     def find_humcap_equilibrium(self):
         _ = self.minimize_quadED() #Solve using quadratic deviances.
-        self.solve_ED0() #Solve by settings ED=0 in equation system.
+        _ = self.solve_ED0() #Solve by settings ED=0 in equation system.
 
     def quadED(self, r_1d):
         """ Evaluates the objective function for finding the equilibrium on the labor market. 
@@ -1147,7 +1161,7 @@ class GM:
         ED = self.c_ED()
         # objfunc = np.sum(np.abs(ED)) #sum of absolute excess labor demands (scalar function)
         quadED = np.sum(np.square(ED))
-        if self.sim.analytic_grad_quadED:
+        if self.agrad_quadED:
             #Calculate jacobian of objective function (sum(ED^2)) and reshape into 1-D
             return (quadED, self.c_jac_quadED(r=None, ED=ED))
         else:
@@ -1155,76 +1169,29 @@ class GM:
 
 
 
-#%% Various functions
+#%% Initiate model using the saved data from the testing cell below
 
-
-
-#%%
-
-# def func(r_1d):
-#     gm.par.r = r_1d.reshape(gm.par.r.shape, order="F")
-#     gm.precompute_w()
-#     gm.solve_worker()
-#     gm.simulate()
-#     ED = gm.c_ED()
-#     return ED.reshape((gm.par.T * gm.par.S), order="F")
-
-# func(gm.par.r.reshape((gm.par.T * gm.par.S), order="F"))
-
-# (x, infodict, ier, mesg) = optimize.fsolve(func, gm.par.r.reshape((gm.par.T * gm.par.S), order="F"), full_output=True)
-
-# gm.par.r
-
-# def solve_ED(self, r_1d):
-# """ Evaluates the objective function for finding the equilibrium on the labor market. 
-#     The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
-#     that the first entries vary the year and keep the sector fixed. 
-#     The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
-#     The function also return analytic gradients when self.sim.analytic_grad_ED is True.
-#     """
-# self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
-# self.precompute_w() #With new skill prices, update wages
-# self.solve_worker() #solve the worker's problem
-# self.simulate()
-# #Calculate excess labor demand
-# ED = self.c_ED()
-
-
-#Test af gradienter: 
-# 1. Analytisk ll i partiel model
-# 2. Analytisk for indre loop (ligevægt mht. r)
-# 3. Analytisk ll for GE model.
-
-gm = GM(endo_D=True, analytic_grad_quadED=True)
-gm.setup(simple_statespace=False)
-gm.c_human_capital_unit_prices()
+gm = GM(endo_D=False)
+gm.l_data("data_equilibrium_default_values.pkl")
+gm.setup()
 gm.allocate()
 gm.precompute()
-gm.solve_worker()
-gm.c_simulated_data()
-gm.l_init_distribution()
 gm.l_cohorts()
+gm.l_init_distribution()
 gm.c_D_from_data()
-gm.simulate()
-gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
-gm.c_theta_idx()
-gm.c_theta0()
-gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=False)
-# 1. Partial:
-initvals = gm.est.theta0.copy()
-assert optimize.check_grad(gm.obj_func, gm.score_from_theta, initvals) < 1e-8
-# 2. Technically still in partial mode, ED wrt. r gradients
-gm.setup_sim(analytic_grad_quadED=False)
-r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F").copy()
-assert optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d) < 1e-6, \
-       "Differences between analytic and numeric gradients are too large"
+gm.setup_estimation(agrad_loglik=True, parameters=["beta0"], indexes=None)
+gm.estimate()
+
+#%% Now, to develop new stuff! 
+# du genbruges eller xi_in.
 
 
-#%% Find equilibrium before simulating new data where r is in equilibrium
 
-gm = GM(endo_D=True, analytic_grad_quadED=False)
+#%% Code for testing the general equilibrium gradients (quadED, ED0 and loglik) as well as simulate data after estimation.
+
+gm = GM(endo_D=True)
+update_attrs(gm, agrad_quadED=False)
 gm.setup(simple_statespace=False)
-gm.c_human_capital_unit_prices()
 gm.allocate()
 gm.precompute()
 gm.solve_worker()
@@ -1233,37 +1200,27 @@ gm.l_init_distribution()
 gm.l_cohorts()
 #gm.c_D_from_data()
 gm.simulate()
-gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=True)
-# gm.setup_sim(analytic_grad_quadED=True)
+update_attrs(gm, partial_model=False)
+gm.setup_estimation(method="BFGS", agrad_loglik=True)
+# update_attrs(gm.sim, agrad_quadED=True)
 gm.minimize_quadED() #find equilibrium without using analytic gradients (cannot since it needs D, which needs data.)
 #Simulate new data using the current skill prices, which are in equilibrium.
 gm.c_simulated_data()
-gm.setup_sim(endo_D=False)
+update_attrs(gm.sim, endo_D=False)
 gm.c_D_from_data()
-gm.setup_sim(analytic_grad_quadED=True)
+update_attrs(gm, agrad_quadED=True)
+update_attrs(gm.sim, endo_D=False)
 #Find equilibrium while using gradients to check that it works.
 res = gm.minimize_quadED()
 # Find equilibrium skill prices using fsolve:
 (x, infodict, ier, mesg) = gm.solve_ED0()
-gm.setup_sim(analytic_grad_quadED=False)
+update_attrs(gm, agrad_quadED=False)
 r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F").copy()
-
-# gm.objfunc_ED(r_1d)
-# np.sqrt(np.sum(np.square(optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08, gm.objfunc_ED, 0) - gm.c_jacob_objfunc_ED(r_1d))))
-# optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08, gm.objfunc_ED, 0)
-# optimize.approx_fprime(r_1d, get_grad_from_vector, 1.4901161193847656e-08)
-
-def check_grad(x0, f, jac, args_f=[], kwargs_jac={}):
-    approx_fprime = optimize.approx_fprime(xk=x0, f=f, epsilon=1.4901161193847656e-08, *args_f)
-    err = approx_fprime - jac(x0, **kwargs_jac)
-    return np.sqrt(np.sum(np.square(err)))
 
 
 #Outer equilibrium loop gradient check
-args_f = [gm.quadED]
 g = lambda x: gm.c_jac_quadED(x).reshape((gm.par.T * gm.par.S), order="F")
-assert check_grad(r_1d, gm.quadED, g) < 1e-7
-
+assert pyf.check_grad(r_1d, gm.quadED, g) < 1e-7
 
 #Inner equilibrium loop gradient check
 n = 0
@@ -1271,187 +1228,38 @@ for s in np.arange(gm.par.S):
     for t in np.arange(gm.par.T):
         f = lambda x: gm.ED_from_r(x)[n]
         g = lambda x: gm.dED_dr(x)[t, s, :, :].reshape((gm.par.T * gm.par.S), order="F")
-        assert check_grad(x0=r_1d, f=f, jac=g) < 1e-7, "Inner solver gradient wrong"
+        assert pyf.check_grad(x0=r_1d, f=f, jac=g) < 1e-7, "Inner solver gradient wrong"
         n += 1
 
-#Loglik gradient check in general equilibrium
-gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
-gm.c_theta_idx()
-gm.c_theta0()
-gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=False)
+#Loglik gradient checks (partial model and in general equilibrium)
+gm.setup_estimation(parameters=["beta0"], indexes=np.array([2, 1]), agrad_loglik=False)
+gm.partial_model = True
 
+# loglik gradient in the partial model:
+initvals = gm.est.theta0.copy()
+assert pyf.check_grad(x0=initvals, f=gm.ll_objfunc, jac=gm.score_from_theta) < 1e-7
+
+# loglik gradient in general equlibrium model
+gm.partial_model = False
 theta0 = gm.est.theta0.copy() 
-res = optimize.approx_fprime(theta0, gm.obj_func, 1.4901161193847656e-08)
+res = optimize.approx_fprime(theta0, gm.ll_objfunc, 1.4901161193847656e-08)
 gm.score_from_theta(theta0)
-assert check_grad(theta0, gm.obj_func, gm.score_from_theta) < 1e-7, "Loglikelihood works"
+assert pyf.check_grad(theta0, gm.ll_objfunc, gm.score_from_theta) < 1e-7, "Loglikelihood does not work"
 
+#Save data before moving parameters
+gm.find_humcap_equilibrium()
+gm.c_simulated_data()
+gm.s_data("data_equilibrium_default_values")
 
-#Ja de her dummies skal lige rettes til. Og så er der noget omkring hvilke gradienter der bruges hvor.
-# mangler stadig gradienter i solve_ED.
-#navnene til alt det der ED skal også fixes.
-#Er partial ikke mere en generel setting end en estimationsting? joo.
+update_attrs(gm.est, agrad_loglik=True)
+gm.estimate()
 
-#%%
-
-gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([2, 1]))
+#Tjek om vi kan estimere os tilbage til (tilpas tæt på) de sande parametre.
+gm.par.beta0[gm.est.pars_to_estimate["beta0"]] *= np.array([1.25, 0.75])
 gm.c_theta0()
-gm.c_theta_idx()
-gm.setup_estimation(method="BFGS", partial=False, analytic_gradients=True)
+gm.estimate()
 
-#%% test Loglik med GE
-
-optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
-
-g = gm.gradients()
-
-gm.est.analytic_gradients = False
-
-gm.score_from_theta(gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
-
-# assert 
-
-optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]])
-
-
-#  < 1e-7, \
-#        "Differences between analytic and numeric gradients are too large"
-
-
-#%%
-dED_theta = gm.partial_ED("theta")
-dED_r = gm.partial_ED("r")
-
-gm.par.r.reshape((gm.par.T * gm.par.S), order="F")
-
-
-#order F means the first index, time, switches faster. So the first values loop through t' keeping s' fixed before switching to the next s'
-# ED.reshape((gm.par.T * gm.par.S), order="F") 
-
-#A mimicks dED_r
-# A = np.arange(0, dED_r.size).reshape((S, T, S, T), order="C").swapaxes(0, 1).swapaxes(2, 3)
-# B = A.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")
-
-# dED_dr_inv = np.linalg.inv(self.partial_ED("r").swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")) 
-# dED_dr_inv = np.linalg.inv(dED_r.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
-
-# C = np.arange(dED_theta.size).reshape((T*S, self.est.n_params), order="F")
-
-# b = np.arange(36).reshape((6, 6), order="F")
-# c = np.arange(12).reshape((6, 2), order="F")
-# A = np.arange(0, dED_dr.size).reshape(dED_dr.shape, order="C")
-
-# #t, s, t', s'
-# A[0, 0, 0, 0]
-
-# dED_dr.shape 
-
-# dED_theta_2d = - dED_theta.reshape((T*S, self.est.n_params), order="F")
-
-# dlnP_dr = gm.dlnP("r")
-
-# dr_dtheta = np.matmul(dED_dr_inv, dED_theta_2d)
-
-# dr_dtheta.shape
-
-# dlnP_dr.shape
-
-# d = self.est.simulated_data
-# # dlnP = self.gradients()
-# dL_dr = - np.sum(dlnP_dr[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
-
-# led2 = np.matmul(dL_dr.reshape((T*S), order="F"), dr_dtheta)
-# dL_dtheta = np.sum(gm.dlnP("theta")[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / len(d)
-
-# dL_dtheta + led2
-
-
-
-# led2.shape
-
-# dED_dr_inv.shape
-# dED_theta_2d.shape
-
-# dED_theta[0, 0, 0]
-# dED_theta[1, 0, 0]
-# dED_theta_2d[0, 0]
-# dED_theta_2d[1, 0]
-
-# dED_dr_inv.shape
-
-# x = gm.partial_ED("r")
-# y = np.load("grad_r_old.npy")
-
-
-# gm.c_theta0()
-# gm.score_from_theta(self.par.beta0[gm.est.pars_to_estimate["beta0"]])
-
-# res = gm.GE_humcap()
-
-#
-# 
-# new = gm.c_jacob_objfunc_ED(r_1d).copy()
-
-# r_1d *= 4
-# optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d)
-#%%
-gm.setup_sim(analytic_grad_quadED=False)
-r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F")
-assert optimize.check_grad(gm.objfunc_ED, gm.c_jacob_objfunc_ED, r_1d) < 1e-7, \
-       "Differences between analytic and numeric gradients are too large"
-
-#%%
-
-
-
-# %% Run
-
-gm = GM()
-gm.setup(simple_statespace=False)
-gm.c_human_capital_unit_prices()
-gm.allocate()
-gm.precompute()
-gm.solve_worker()
-gm.simulate()
-gm.solve_humancap_equilibrium()
-r_old = gm.par.r.copy()
-# gm.par.r = gm.par.r * 1.5
-res = gm.GE_humcap()
-
-res.x.reshape(r_old.shape) - r_old
-np.isclose(res.x.reshape(r_old.shape), r_old)
-
-#%%
-#Perturb and try again
-gm.par.beta0[np.array([1, 2])] *= np.array([0.5, 1.5])
-res = gm.GE_humcap()
-
-res
-
-#%%
-
-#%%
-# gm.c_simulated_data(n_individuals=50_000)
-gm.setup_estimation(method="BFGS", partial=True, analytic_gradients=True)
-gm.c_pars_to_estimate(parameters=["beta0"], indexes=np.array([1, 2]))
-gm.c_theta_idx()
-gm.c_theta0()
-
-#%%
 
 
 #%%
 
-# np.save("P_old", gm.sol.P)
-# np.save("density_old", gm.sim.density)
-# np.save("score_old", gm.score())
-
-#%%
-
-
-#%% Compare analytic and numeric gradients
-
-gm.est.analytic_gradients = False
-
-
-assert optimize.check_grad(gm.obj_func, gm.score_from_theta, gm.par.beta0[gm.est.pars_to_estimate["beta0"]]) < 1e-7, \
-       "Differences between analytic and numeric gradients are too large"
