@@ -1,27 +1,7 @@
 #"""  Defines the class that calculates gradients for the Green Mobility (GM) project code."""
 #%%
 
-# from operator import index
-# from turtle import update
-# from types import SimpleNamespace
-# from collections import OrderedDict
 import numpy as np
-# import pandas as pd
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-# from scipy import optimize
-# from numpy.random import default_rng
-# from mpl_toolkits import mplot3d
-
-# np.set_printoptions(precision=3)
-# sns.set_theme()
-# import warnings
-# warnings.filterwarnings("error", category=RuntimeWarning)
-# import pyfuncs as pyf
-
-# def update_attrs(ns, **kwargs):
-#     for k, v in kwargs.items():
-#         setattr(ns, k, v)
 
 #%%
 
@@ -121,10 +101,20 @@ class gradients:
             theta_idx = self.est.theta_idx
             w = self.sol.w
 
-            du = np.zeros(self.sol.P.shape + (self.est.n_params,)) #wrong when sigma is also estimated I think.
-            for para in [k for k in pte.keys() if k in par.groups.utility]: #could this be precomputed? Yes, in setup_estimation perhaps. 
+            du = np.zeros(self.sol.P.shape + (self.est.n_params[g],))
+            for para in [k for k in pte.keys() if k in par.groups[g]]: #could this be precomputed? Yes, in setup_estimation perhaps. 
                 if para == "beta0":
                     du[..., pte[para], theta_idx[para]] = w[..., pte[para]] * par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(par.scale, para)
+                elif para == "xi_in":
+                    du[:, :, :, pte[para], theta_idx[para]] = - par.M[:, :, np.newaxis, pte[para]]
+                elif para == "xi_out":
+                    du[pte[para], :, :, :, theta_idx[para]] = - par.M[pte[para], :, np.newaxis, :]
+                elif para == "kappa0":
+                    du[:, :, :, :, theta_idx[para]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
+                                                      par.ages[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis] / getattr(par.scale, para)
+                elif para == "kappa1":
+                    du[:, :, :, :, theta_idx[para]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
+                                                      np.square(par.ages[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis]) / getattr(par.scale, para)
                 else:
                     raise Exception()
         elif g == "r":
@@ -175,9 +165,9 @@ class gradients:
         if g is "r":
             ndim_add = (np.newaxis, np.newaxis) #when differentiating wrt. r, there are two additional dimensions (t' and s')
             shape_add = (par.T, par.S)
-        else:
+        elif g is "utility":
             ndim_add = (np.newaxis,) #all other derivatives are simply a parameter vector dimension
-            shape_add = (self.est.n_params,)
+            shape_add = (self.est.n_params[g],)
 
         dEV = np.zeros(self.sol.EV.shape + shape_add) #her tager den alle parametrene, selvom det kun er dem i utility vi regner på nu. kommer fejl senere.
         dv = np.zeros(P.shape + shape_add) #derivatives of choice-specific value functions
@@ -240,7 +230,7 @@ class gradients:
         """ Calculates analytic gradients of the log likelihood function. 
             When the model is solved in partial mode, this assumes dr/dtheta = 0 and so only the partial effect dll/dtheta remains.
         """
-        
+        #todo: når sigma kommer ind skal der laves om her.
         ts_indexes = self.ts_indexes
         par = self.par
         
@@ -286,18 +276,9 @@ class gradients:
 
             #the two outputs
             dlnP_dtheta = 1/par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
-            dr_dtheta = np.matmul(dED_dr_inv, - dED.reshape((T*S, self.est.n_params), order="F"))
+            dr_dtheta = np.matmul(dED_dr_inv, - dED.reshape((T*S, self.est.n_params["total"]), order="F"))
 
             return (dr_dtheta, dlnP_dtheta, dlnP_dr)
-
-                #equation with label dll_dtheta in the paper
-                #done dED_dr_inv = np.linalg.inv(self.partial_ED("r").swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C")) 
-                #done dr_dtheta = np.matmul(dED_dr_inv, - self.partial_ED("theta").reshape((T*S, self.est.n_params), order="F"))
-                # dll_dtheta = self.partial_ll(self.dlnP("theta"))
-                # done (uden ll) dll_dr = self.partial_ll(self.dlnP("r"))
-                
-                #1-dimensional array with shape (nparams,)
-                # return dll_dtheta + np.matmul(dll_dr.reshape((T*S), order="F"), dr_dtheta)
             
             # #Unpack
             # # w = self.sol.w

@@ -28,6 +28,13 @@ def update_attrs(ns, **kwargs):
     for k, v in kwargs.items():
         setattr(ns, k, v)
 
+def get_key_from_value(dict, value):
+    keys = [k for k in dict.keys() if value in dict[k]]
+    assert len(keys) == 1
+    return keys[0]
+
+
+
 
 #%%
 
@@ -98,23 +105,13 @@ class GM:
         par.ages = np.arange(par.a_min, par.a_max + 1)
         par.N_ages = par.a_max + 1 - par.a_min
 
-        # #Helper object for calculating gradients of excess labor demand. Used e.g. in partial_ED 
-        self.sim.ts_indexes = np.transpose([np.tile(np.arange(0, par.T), par.S), np.repeat(np.arange(0, par.S), par.T)])
-
     def setup(self, simple_statespace=False, **kwargs):
         """ Initiates parameter values at their default values. Also populates meta settings. Specify named
             'keyword=value' to the function to replace default values by those specified in 'value'. 
         """
         
         par = self.par
-        par.groups = SimpleNamespace()
         self.setup_statespace(simple_statespace)
-        
-        #Meta-settings
-        # sol = self.sol
-        # sol.step_fraction = 0.05
-        # sol.maxiter = 50000
-        # sol.tolerance_r = 1e-10
 
         #Fixed quantities from data
         par.MASS = self.load_MASS()
@@ -134,7 +131,6 @@ class GM:
         par.sigma = 0.8
 
         #Human capital function parameters
-        # par.beta0 = np.array([0.002, 0.006, 0.012, 0.008])[:par.S] #1-dimensional over sectors. 
         par.beta0 = np.array([0.2, 0.6, 1.2, 0.8])[:par.S] #1-dimensional over sectors. 
         par.scale.beta0 = 100 #Meaning true parameters are x times smaller than the values in the code
 
@@ -147,13 +143,13 @@ class GM:
             par.xi_out = np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
 
         #Individual characteristics scaler of moving costs
-        par.kappa = np.array([1, -0.001])
-        par.scale.kappa = 100
+        par.kappa0 = 1
+        par.scale.kappa0 = 100
+        par.kappa1 = -0.001
+        par.scale.kappa1 = 1000
 
         #Define parameter groups. These are used in self.gradient().
-        par.groups.sigma = ["sigma"]
-        par.groups.utility = ["beta0", "xi_in", "xi_out"]
-        par.groups.prices = ["r"]
+        par.groups = {"sigma":["sigma"], "utility":["beta0", "xi_in", "xi_out", "kappa0", "kappa1"], "r":["r"]}
 
         # #Replace default values by those given explicitly to the method
         for k, v in kwargs.items():
@@ -172,15 +168,23 @@ class GM:
         #                  columns=pd.MultiIndex.from_product([["r0", "r1"], range(0, self.sol.maxiter)], 
         #                                                     names=["Pre/post", "Iteration"]))
 
-    def c_switching_cost_matrix(self):
-        """ Takes the xi-parameters and constructs the matrix of switching costs."""
+    def c_m1(self):
         par = self.par
-
-        #Switching cost (M) has dimensions (s_{t-1} x age x s_{t}) i.e. (s_out x age x s_in) where age component comes from m2 in M = m1 * m2
         m1 = np.exp(np.sum(np.meshgrid(par.xi_in, par.xi_out), axis=0)) #add cost of going OUT of a sector with the cost of going IN to a sector.
         np.fill_diagonal(m1, 0) #Not switching sector is costless
-        m2 = np.exp(np.array(par.ages * par.kappa[0] / par.scale.kappa + np.square(par.ages) * par.kappa[1] / par.scale.kappa))
-        par.M = m1[:, np.newaxis, :] * m2[np.newaxis, :, np.newaxis]
+        return m1
+
+    def c_m2(self):
+        par = self.par
+        return np.exp(np.array(par.ages * par.kappa0 / par.scale.kappa0 + np.square(par.ages) * par.kappa1 / par.scale.kappa1))
+
+    def c_switching_cost_matrix(self):
+        """ Takes the xi-parameters and constructs the matrix of switching costs."""
+
+        #Switching cost (M) has dimensions (s_{t-1} x age x s_{t}) i.e. (s_out x age x s_in) where age component comes from m2 in M = m1 * m2
+        m1 = self.c_m1()
+        m2 = self.c_m2()
+        self.par.M = m1[:, np.newaxis, :] * m2[np.newaxis, :, np.newaxis]
 
     def load_MASS(self, version="constant"):
         """ Creates a time series of MASS."""
@@ -353,8 +357,6 @@ class GM:
         assert all(np.around(np.sum(density, axis=(0, 1, 3)), 7) == 1), "Summing over state space (excluding time) and choices does not yield density == 1"
         self.sim.density = density
 
-   
-
     def l_cohorts(self, simulated_data=True):
         """ Loads data on cohorts from the simulated data."""
         if simulated_data:
@@ -375,59 +377,6 @@ class GM:
     #     """This method calculates post-estimation quantities such as TFP (A), 
     #         physical capital (K), clean energy (E) and dirty energy (O)"""
     #     #This could change if we switch to the abatement form (JBE).
-
-    # def savefig(self, fig, figname):
-    #     """Save the figure object 'fig' as a .pdf with name 'figname'. """
-    #     fig.savefig(self.resultspath + figname +  "_" + self.name + "_" + self.version + ".pdf", bbox_inches='tight')
-
-    # def fig_employment_shares(self, save=False):
-    #     """ Creates a figure of employment shares in each sector, over time"""
-    #     #Unpack
-    #     emp = np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2)))
-    #     sector_names = self.par.sector_names
-
-    #     fig = plt.figure(figsize=(5, 3.5), dpi=100)
-    #     ax = fig.add_subplot(1, 1, 1)
-
-    #     for s, name in enumerate(sector_names):
-    #         ax.plot(emp[:, s], label=name)
-
-    #     ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
-    #     ax.set_xlabel("Time")
-    #     ax.set_ylabel("Employment share")
-    #     ax.set_title("Employment shares over time")
-
-    #     if save:
-    #         self.savefig(fig, "employment_shares")
-
-    # def fig_avg_wages(self, save=False):
-    #     """ Creates a figure of average wages across ages, over time"""
-    #     #Unpack
-    #     w = np.mean(self.sol.w, 0)
-    #     sector_names = self.par.sector_names
-        
-    #     fig = plt.figure(figsize=(5, 3.5), dpi=100)
-    #     ax = fig.add_subplot(1, 1, 1)
-
-    #     for s, name in enumerate(sector_names):
-    #         ax.plot(w[:, s], label=name)
-
-    #     ax.legend(loc='upper center', frameon=True, bbox_to_anchor=(0.5, -0.15), ncol=self.par.S)
-    #     ax.set_xlabel("Time")
-    #     ax.set_title("Average wages")
-    #     ax.set_ylabel("Average wage across ages")
-
-    #     if save:
-    #         self.savefig(fig, "average_wages")
-
-    # def uncond_switching_probs(self):
-    #     """ Construct table of unconditional switching probabilities. This calculates only net-flows. Should be recomputed for gross-flows.
-    #         e.g. such that with just two sectors, if workers are 50/50 dsitributed  and they all switch sectors, the probabilities do not become 0. """
-    #     d = self.sim.density
-    #     #todo unconditional switching probabilities.
-    #     # #Do not include period 0, since the transition calculated from that means period -1 to period 0, which lies outside the model
-    #     # probs = np.mean(np.sum(d[:, :, 1:, :], axis=1) / np.sum(d[:, :, 1:, :], axis=(1, 3))[:, np.newaxis, :], axis=2)
-    #     # self.results.tables.uncond_switching_probs = pd.DataFrame(probs, index=self.par.sector_names, columns=self.par.sector_names)
 
     def c_pars_to_estimate(self, parameters=None, indexes=None):
         """ Constructs an ordered dictionary where keys are parameter names
@@ -462,18 +411,19 @@ class GM:
         self.c_gs()
 
     def c_n_params(self):
-        """ Could this method be removed and simply used len(theta_idx)?"""
-        n_params = 0
-        for _, index in self.est.pars_to_estimate.items():
+        n_params = {**{"total":0}, **{k:0 for k in self.par.groups.keys() if k is not "r"}}
+        for p, index in self.est.pars_to_estimate.items():
             if index is None:
-                n_params += 1
+                n_params["total"] += 1
+                n_params[get_key_from_value(self.par.groups, p)] += 1
             else:
-                n_params += len(index)
+                n_params["total"] += len(index)
+                n_params[get_key_from_value(self.par.groups, p)] += len(index)
         self.est.n_params = n_params
 
     def c_gs(self):
-        """Define the parameter groups (shorthand: gs) to be estimated. It is in inferred directly from self.est.pars_to_estimate."""
-        self.est.gs = set([g for g in vars(self.par.groups).keys() for p in self.est.pars_to_estimate if p in vars(self.par.groups)[g]])
+        """Define the parameter groups (shorthand: gs) to be estimated. It is inferred directly from self.est.pars_to_estimate."""
+        self.est.gs = set([g for g in self.par.groups.keys() for p in self.est.pars_to_estimate if p in self.par.groups[g]])
 
     def c_theta_idx(self):
         pte = self.est.pars_to_estimate
@@ -500,7 +450,7 @@ class GM:
         #Initialize theta0 with the correct length.
         # theta0 = np.zeros(np.sum([len(pte[k]) if pte[k] is not None else 1 for k in pte]))
         # theta0 = np.zeros(max(theta_idx[next(reversed(theta_idx))]) + 1) #last element of theta_idx stores the
-        theta0 = np.zeros(self.est.n_params)
+        theta0 = np.zeros(self.est.n_params["total"])
         # n = 0 #counter for index in theta0 itself
 
         for par, index in pte.items():
@@ -613,6 +563,7 @@ class GM:
             are ignored. """
         # print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
+        self.c_switching_cost_matrix()
         self.precompute()
         self.solve_and_simulate()
         
@@ -643,6 +594,7 @@ class GM:
         """
         #unpack
         self.update_par(self.par, theta, self.est.pars_to_estimate)
+        self.c_switching_cost_matrix()
         self.precompute()
         self.solve_and_simulate()
         return self.score()
@@ -712,7 +664,7 @@ class GM:
 
     def plot_ll_3d(self, x_values, y_values):
         """ Plot the loglikelihood as a function of two parameters."""
-        assert self.est.n_params == 2, "Exactly 2 parameters must be chosen for plotting."
+        assert self.est.n_params["total"] == 2, "Exactly 2 parameters must be chosen for plotting."
 
         z = np.zeros((len(x_values)*(len(y_values))))
 
@@ -776,7 +728,7 @@ class GM:
                 self.par.r = r.reshape(self.par.r.shape, order="F")
             elif r.ndim == 2:
                 self.par.r = r
-            self.precompute_w()
+            self.precompute_w() #only wages need to be updated when the only thing we change is r
             self.solve_worker()
             self.simulate()
             
@@ -870,12 +822,6 @@ class GM:
     def fig_avg_wages(self, save=False):
         output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).fig_avg_wages(save=save)
 
-#%%
-
-
-
-
-
 #%% Initiate model using the saved data from the testing cell below
 
 gm = GM(endo_D=False)
@@ -888,14 +834,17 @@ gm.l_init_distribution()
 gm.solve_worker()
 gm.c_D_from_data()
 gm.simulate()
-gm.setup_estimation(agrad_loglik=True, parameters=["beta0"], indexes=None)
+
+
+# importlib.reload(gradients)
+#%%
+
 gm.estimate()
 gm.c_simulated_data()
 
 
 #%% Now, to develop new stuff! 
 
-# importlib.reload(output)
 
 #%% Code for testing the general equilibrium gradients (quadED, ED0 and loglik) as well as simulate data after estimation.
 #Should eventually be moved to a different script?
@@ -928,7 +877,6 @@ res = gm.minimize_quadED()
 update_attrs(gm, agrad_quadED=False)
 r_1d = gm.par.r.reshape((gm.par.T * gm.par.S), order="F").copy()
 
-
 #Outer equilibrium loop gradient check
 g = lambda x: gm.c_jac_quadED(x).reshape((gm.par.T * gm.par.S), order="F")
 assert util.check_grad(r_1d, gm.quadED, g) < 1e-7
@@ -943,7 +891,7 @@ for s in np.arange(gm.par.S):
         n += 1
 
 #Loglik gradient checks (partial model and in general equilibrium)
-gm.setup_estimation(parameters=["beta0"], indexes=np.array([2, 1]), agrad_loglik=False)
+gm.setup_estimation(parameters=["kappa1", "beta0", "kappa0", "xi_in", "xi_out"], indexes=None, agrad_loglik=False)
 gm.partial_model = True
 
 # loglik gradient in the partial model:
@@ -966,9 +914,9 @@ update_attrs(gm.est, agrad_loglik=True)
 gm.estimate()
 
 #Tjek om vi kan estimere os tilbage til (tilpas tæt på) de sande parametre.
-gm.par.beta0[gm.est.pars_to_estimate["beta0"]] *= np.array([1.25, 0.75])
-gm.c_theta0()
-gm.estimate()
+# gm.par.beta0[gm.est.pars_to_estimate["beta0"]] *= np.array([1.25, 0.75])
+# gm.c_theta0()
+# gm.estimate()
 
 
 
