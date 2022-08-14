@@ -74,8 +74,9 @@ class output:
             
             
     def t_avg_yearly_transition_rates(self, data=True):
-        """ Construct table of unconditional switching probabilities. This calculates only net-flows. Should be recomputed for gross-flows.
-            e.g. such that with just two sectors, if workers are 50/50 dsitributed  and they all switch sectors, the probabilities do not become 0. """ 
+        """ Construct a table of average yearly transition rates. 
+            The argument 'data' determines whether it is calculated from the data or from the model simulation.
+        """ 
         if data:
             d = self.est.simulated_data
             df = d.groupby(["slag", "t"])["s"].value_counts(normalize=True).mean(level=(0, 2)).unstack()
@@ -88,6 +89,7 @@ class output:
 
 
     def f_age_profile_switching(self, save):
+        """ Construct a figure of the age profile of sector switching."""
         P = self.sol.P
 
         # 1) Model switching
@@ -130,6 +132,7 @@ class output:
             plt.show()
 
     def f_time_profile_switching(self, save):
+        """ Construct a figure of the time profile of switching"""
         P = self.sol.P
 
         # 1) Model switching

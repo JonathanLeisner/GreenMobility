@@ -47,10 +47,9 @@ class gradients:
 
     def du(self, g):
         """ Calculates du with respect to some group of parameters, e.g. utility parameters, sigma or r. This choice determines the functional form
-            implicitly (or if you look in the code actually, explicitly) used to calculate du. """
-
-        #I make it such that du always has the same dimension for a given parameter type (r or actual parameter).
-        # assert g in ["utility", "sigma", "price"]. g refers to parameter type groups.
+            implicitly (or if you look in the code actually, explicitly) used to calculate du. 
+            The dimensions of du is state space + 1 when g is not "r" and state space + 2 when g is "r".    
+        """
 
         #unpack
         par = self.par
@@ -91,7 +90,8 @@ class gradients:
         return du
 
     def dv_and_dEV(self, du, g):
-        """ Calculates dv and dEV from du. g specifies whether the derivative is with respect to r or parameters, since this determines whether we have
+        """ Calculates dv (alternative-specific value function derivatives) and dEV (expected value function derivatives) from du. 
+            g specifies whether the derivative is with respect to r or parameters, since this determines whether we have
             to add two dimensions or one (since r is defined over s and t while parameters are collected in one dimension). 
             The function only returns dv since dEV is never necessary to know on its own if we know dv.
             The calculation of derivatives follows the same backwards recursion structure as the solution to the worker's problem.
@@ -142,7 +142,8 @@ class gradients:
         return dv
 
     def dED_dr(self):
-        """ This function is used only when we are only interested in the derivative wrt. r, i.e. for the equilibrum determination. """
+        """ Calculates the derivatives of the excess labor demands with respect to skill prices.
+            The method is used only for calculating derivatives for the equilibrum conditions, and not log likelihood. """
         du = self.du("r")
         dv = self.dv_and_dEV(du, "r")
         dP = self.dP(dv, "r")
@@ -151,6 +152,7 @@ class gradients:
         return dED
 
     def dHdem_dr(self):
+        """ Calculate the derivative of labor demand with respect to skill prices r."""
         par = self.par
         ts_indexes = self.ts_indexes
         dHdem = np.zeros((par.T, par.S, par.T, par.S))
@@ -159,6 +161,9 @@ class gradients:
         return dHdem
 
     def dlnP(self, dv, g):
+        """ Calculate the derivatives of log choice probabilities, the only component of the log likelihood function. 
+            They are calculated from the derivatives of alternative-specific value functions (dv). 
+        """
         if g is "r":
             return 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
         elif g is "utility":
@@ -174,31 +179,23 @@ class gradients:
         #noget omkring "utiltiy" her skal ændres senere til "sigma" osv også.
         if self.partial_model:
             du = self.du("utility")
-            dv = self.dv_and_dEV(du, "utility") #så længe det er utility-parametre, kan denne køre på samme måde med alle parametrene (ligning 44)
+            dv = self.dv_and_dEV(du, "utility")
             return self.dlnP(dv, "utility")
         else:
             T = par.T
             S = par.S
             
-            #du and dv enter both dED and dlnP
             du = self.du("r")
             dv = self.dv_and_dEV(du, "r")
-            
-            #Intermediate stuff for dED
             dP = self.dP(dv, "r")
             dHsup = self.dHsup(dP, "r")
-
             dED = self.dHdem_dr() - dHsup
             dED_dr_inv = np.linalg.inv(dED.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
-
-            #To be outputted
             dlnP_dr = self.dlnP(dv, "r")
             
             #Theta derivatives
-            #du and dv enter both deD and dlnP
             du = self.du("utility")
             dv = self.dv_and_dEV(du, "utility")
-
             dP = self.dP(dv, "utility")
             dHsup = self.dHsup(dP, "utility")
             dED = - dHsup #parameters cannot affect demand in the model so I simply leave it out

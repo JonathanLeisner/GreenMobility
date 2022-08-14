@@ -25,22 +25,27 @@ import gradients
 import output
 
 def update_attrs(ns, **kwargs):
+    """ Helper function for updating the attributes of a namespace (ns) according to the named keyword arguments. """
     for k, v in kwargs.items():
         setattr(ns, k, v)
 
 def get_key_from_value(dict, value):
+    """ Helper function for finding the key of specific value in a dictionary. 
+        The value must only exist under one key, otherwise an error is thrown.
+    """
     keys = [k for k in dict.keys() if value in dict[k]]
     assert len(keys) == 1
     return keys[0]
-
-
-
 
 #%%
 
 class GM:
     """ Class to solve the model presented in Leisner (2023). 
         Generally, the notation c_[name] for methods means construct/create/calculate an object or attribute called [name].
+        The class relies on three helper modules:
+        util    : Contains helper/utility functions for various simple functionality.
+        gradient: Calculates gradients of the model.
+        output  : Constructs figures and tables from the model.
     """
     def __init__(self, name = None, endo_D=True):
         self.sol = SimpleNamespace()
@@ -83,7 +88,7 @@ class GM:
 
     def setup_statespace(self, simple_statespace):
         """ This function defines the attributes related to the state space. It allows setting 'simple_statespace'
-            to True to get a smaller statespace when testing new features. 
+            to True to get a smaller statespace when testing new features.
         """
         
         #Unpack
@@ -106,8 +111,8 @@ class GM:
         par.N_ages = par.a_max + 1 - par.a_min
 
     def setup(self, simple_statespace=False, **kwargs):
-        """ Initiates parameter values at their default values. Also populates meta settings. Specify named
-            'keyword=value' to the function to replace default values by those specified in 'value'. 
+        """ Initiates parameter values at their default values. Also populates meta settings. Named arguments 
+            'keyword=value' of the function replace default values. 
         """
         
         par = self.par
@@ -171,12 +176,14 @@ class GM:
         #                                                     names=["Pre/post", "Iteration"]))
 
     def c_m1(self):
+        """ Calculate the m1 matrix of switching costs, a component of M."""
         par = self.par
         m1 = np.exp(np.sum(np.meshgrid(par.xi_in / par.scale.xi_in, par.xi_out / par.scale.xi_out), axis=0)) #add cost of going OUT of a sector with the cost of going IN to a sector.
         np.fill_diagonal(m1, 0) #Not switching sector is costless
         return m1
 
     def c_m2(self):
+        """ Calculate the switching cost shifter m2 that depends on individual characteristics. m2 is a component of M."""
         par = self.par
         return np.exp(np.array(par.ages * par.kappa0 / par.scale.kappa0 + np.square(par.ages) * par.kappa1 / par.scale.kappa1))
 
@@ -307,8 +314,8 @@ class GM:
 
     def simulate_endoD(self):
         """ Simulate the model forward for a given set of skill prices. D is endogenous, hence it gets updated according to actual choices in model. 
-        We initialize the model in a point where all points of the state space are equally 
-        populated. Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
+        We initialize the model in the initial state space distribution calculated from the data, using l_init_distribution(). 
+        Then, we iterate forward in time and calculate the share of total employment accounted for by each point 
         in the state space. We do not have to draw gumbel shocks since we implicitly invoke a 'law of large numbers' and simply
         use the conditional choice probabilities as "transition" probabilities. """
 
@@ -368,7 +375,7 @@ class GM:
         self.sim.EnterDist = d[d.a == self.par.a_min].groupby("t")["slag"].value_counts(normalize=True).to_numpy().reshape((self.par.T, self.par.S)).swapaxes(0, 1)
 
     def l_init_distribution(self, simulated_data=True):
-        """ Loads data on initial (1996) distribution of the state space. This is used to initialize the model when simulating from 1996. """
+        """ Loads data on initial (t=0) distribution of the state space. This is used to initialize the model when simulating from 1996. """
         if simulated_data:
             d = self.est.simulated_data
         else:
@@ -413,6 +420,9 @@ class GM:
         self.c_gs()
 
     def c_n_params(self):
+        """ Calculates n_params, which is a dictionary with parameter groups as keys and the number of parameters 
+            to be estimated within each group as values.
+        """
         n_params = {**{"total":0}, **{k:0 for k in self.par.groups.keys() if k is not "r"}}
         for p, index in self.est.pars_to_estimate.items():
             if index is None:
@@ -428,6 +438,9 @@ class GM:
         self.est.gs = set([g for g in self.par.groups.keys() for p in self.est.pars_to_estimate if p in self.par.groups[g]])
 
     def c_theta_idx(self):
+        """ Construct a dictionary with parameters to be estimated as keys. 
+            The values are arrays that indicate these parameters' positions in the theta-vector (the 1-D vector of parameters to be estimated)
+        """
         pte = self.est.pars_to_estimate
 
         n = 0
@@ -443,10 +456,10 @@ class GM:
         self.est.theta_idx = theta_idx
 
     def c_theta0(self):
-        """ Constructs a single, 1-dimensional array containing all the parameters to be estimated.
-            Requires self.pars_to_estimate to be defined (aliased pte here). I use the name theta0 as 
-            the starting values of the parameters to be estimated. 
-            The actual parameter values used are those stored in par when run. """
+        """ Constructs a single, 1-dimensional array containing all the initial values of the parameters to be estimated.
+            Requires self.pars_to_estimate to be defined (aliased pte here). 
+            The parameter values used are those stored in self.par when this method is run. 
+        """
         pte = self.est.pars_to_estimate
         theta_idx = self.est.theta_idx
         #Initialize theta0 with the correct length.
@@ -466,8 +479,8 @@ class GM:
 
     @staticmethod
     def c_index_array(parameter):
-        """ Constructs an index array from a parameter's values in self.par. If the variable is a scalar, 
-            this method returns None, since a scalar cannot be indexed. 
+        """ Constructs an array of indexes from a parameter's values in self.par. If the variable is a scalar, 
+            this method returns None, since I do not index scalars. 
             Examples: 
                 np.array([0.5, 1.5, 2.5])   =>  np.array([0, 1, 2)]
                 10                          =>  None
@@ -483,7 +496,7 @@ class GM:
     def update_par(par, theta, pars_to_estimate):
         """ For each of the values in stated in pars_to_estimate (and their indexes), the 
         corresponding parameter vectors in par are updated. The new values are stored in the 
-        one-dimensional vector theta. """
+        one-dimensional vector theta which is given as an argument. """
         n = 0
         for key, index in pars_to_estimate.items():
             if index is not None:
@@ -499,8 +512,7 @@ class GM:
 
     def setup_estimation(self, parameters=None, indexes=None, method=None, agrad_loglik=True):
         """ This method controls a few different options for estimation.
-            'partial' controls whether skill prices are kept fixed or endogenously determined in equilibrium.
-            'method' controls the optimization algorithm. Common choice is 'BFGS'. 
+            'method' controls the optimization algorithm. Default choice is defined in the init method. 
             'agrad_loglik' controls whether to use numeric approximations for gradients or 
             the analytic gradients. """
         self.c_pars_to_estimate(parameters=parameters, indexes=indexes)
@@ -551,7 +563,9 @@ class GM:
         return res
 
     def solve_and_simulate(self):
-        """ Runs the methods necessary to solve and simulate the model given parameters. """
+        """ Runs the methods necessary to solve and simulate the model given parameters. 
+            If self.partial_model is False, r is adjusted when this method is run too.
+        """
         # self.precompute() #H changes with parameters and so needs to be precomputed again.
         self.solve_worker()
         if not self.partial_model:
@@ -562,7 +576,8 @@ class GM:
     def ll_objfunc(self, theta):
         """ Update parameters, calculate equilibrium and evaluate loglik. If partial = True, 
             the skill prices (r) are kept fixed, and hence the human capital equilibrium conditions 
-            are ignored. """
+            are ignored. 
+        """
         # print(theta)
         self.update_par(self.par, theta, self.est.pars_to_estimate)
         self.c_switching_cost_matrix()
@@ -592,7 +607,7 @@ class GM:
 
     def score_from_theta(self, theta):
         """ Helper function for self.score. This makes score a function of theta so that it can be used 
-            when running functions such as scipy.optimize.check_grad(f, g, theta). 
+            when running functions such as util.check_grad(f, g, theta). 
         """
         #unpack
         self.update_par(self.par, theta, self.est.pars_to_estimate)
@@ -692,6 +707,7 @@ class GM:
         return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / self.est.loglik_scale
 
     def gradients(self):
+        """ Calculates the gradients of the loglikelihood function, using the helper module 'gradients'."""
         if self.partial_model:
             dlnP_dtheta = gradients.gradients(self.par, self.sol, self.est, self.partial_model).ll_gradients()
             return self.partial_ll(dlnP_dtheta)
@@ -738,7 +754,7 @@ class GM:
 
     def c_jac_quadED(self, r=None, ED=None):
         """ r1_id is the collection of skill prices as a 1-D array. 
-            ED can be given directly so I avoid recomputing it."""
+            ED can be given directly to avoid recomputing it."""
         # if r_1d is not None:
         #     self.par.r = r_1d.reshape(self.par.r.shape, order="F")
         #     self.solve_and_simulate()
@@ -753,12 +769,9 @@ class GM:
 
 
     def ED_from_r(self, r_1d):
-        """ Evaluates the objective function for finding the equilibrium on the labor market. 
-            The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
+        """ Calculates the excess labor demands from a new vector (1-D) of skill prices. 
+            In this vector, index t moves the fastest, implying for example 
             that the first entries vary the year and keep the sector fixed. 
-            The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
-            The function also return analytic gradients when self.agrad_quadED is True.
-            REWRITE THIS DOCSTRING.
         """
         self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
         self.precompute_w()
@@ -783,15 +796,19 @@ class GM:
         return (x, infodict, ier, mesg)
 
     def find_humcap_equilibrium(self):
-        _ = self.minimize_quadED() #Solve using quadratic deviances.
-        _ = self.solve_ED0() #Solve by settings ED=0 in equation system.
+        """ Find the prices r that set all excess labor demands equal to zero. 
+            This is done in two steps. 
+            First, a quadratic loss function of squared and summed excess labor demands is minimized. 
+            Second, the equation system ED = 0 is solved."""
+        _ = self.minimize_quadED() 
+        _ = self.solve_ED0()
 
     def quadED(self, r_1d):
-        """ Evaluates the objective function for finding the equilibrium on the labor market. 
+        """ Evaluates the first of two objective functions for finding the equilibrium on the labor market. 
             The function takes a 1-dimensional vector of skill prices. In this vector, index t moves the fastest, implying for example 
             that the first entries vary the year and keep the sector fixed. 
             The function resolves the model for this new vector of skill prices and evaluates whether the sum of absolute excess labor demands are zero.
-            The function also return analytic gradients when self.sim.analytic_grad_ED is True.
+            The function also returns analytic gradients when self.agrad_quadED is True.
             """
         self.par.r = r_1d.reshape(self.par.r.shape, order="F") #Update rental prices
         self.precompute_w() #With new skill prices, update wages
@@ -810,21 +827,29 @@ class GM:
             return quadED
 
     def output(self):
+        """ Helper function for invoking methods from the class 'output' in the module 'output'"""
         return output.output(self.par, self.sol, self.sim, self.est, self.name, self.version)
 
     def t_avg_yearly_transition_rates(self, data=True):
+        """ Construct a table of average yearly transition rates. 
+            The argument 'data' determines whether it is calculated from the data or from the model simulation.
+        """ 
         print(self.output().avg_yearly_transition_rates(data=data))
 
     def f_age_profile_switching(self, save=False):
+        """ Construct a figure of the age profile of sector switching."""
         self.output().f_age_profile_switching(save=save)
 
     def f_time_profile_switching(self, save=False):
+        """ Construct a figure of the time profile of switching"""
         self.output().f_time_profile_switching(save=save)
 
     def f_employment_shares(self, save=False):
+        """ Construct a figure of employment shares from the model solution."""
         self.output().f_employment_shares(save=save)
 
     def f_avg_wages(self, save=False):
+        """ Construct a figure of avg wages over time. """
         self.output().f_avg_wages(save=save)
 
 #%% Initiate model using the saved data from the testing cell below
