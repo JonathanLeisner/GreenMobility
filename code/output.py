@@ -28,7 +28,7 @@ class output:
         fig.savefig(self.resultspath + figname +  "_" + self.name + "_" + self.version + ".pdf", bbox_inches='tight')
         plt.close(fig)
 
-    def fig_employment_shares(self, save=False):
+    def f_employment_shares(self, save=False):
         """ Creates a figure of employment shares in each sector, over time"""
         #Unpack
         emp = np.sum(self.sim.density, axis=tuple(i for i in range(self.sim.density.ndim - 2)))
@@ -50,7 +50,7 @@ class output:
         else:
             plt.show()
 
-    def fig_avg_wages(self, save=False):
+    def f_avg_wages(self, save=False):
         """ Creates a figure of average wages across ages, over time"""
         #Unpack
         w = np.mean(self.sol.w, axis=0)
@@ -73,7 +73,7 @@ class output:
             plt.show()
             
             
-    def avg_yearly_transition_rates(self, data=True):
+    def t_avg_yearly_transition_rates(self, data=True):
         """ Construct table of unconditional switching probabilities. This calculates only net-flows. Should be recomputed for gross-flows.
             e.g. such that with just two sectors, if workers are 50/50 dsitributed  and they all switch sectors, the probabilities do not become 0. """ 
         if data:
@@ -87,7 +87,7 @@ class output:
         return df.to_latex()
 
 
-    def age_profile_switching(self, save):
+    def f_age_profile_switching(self, save):
         P = self.sol.P
 
         # 1) Model switching
@@ -129,7 +129,7 @@ class output:
         else:
             plt.show()
 
-    def time_profile_switching(self, save):
+    def f_time_profile_switching(self, save):
         P = self.sol.P
 
         # 1) Model switching

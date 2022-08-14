@@ -45,46 +45,6 @@ class gradients:
                         np.sum(self.est.D[(..., np.newaxis) + ndim_add] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
         return dHsup
 
-        # def partial_ED(self, theta_or_r):
-        #     """ Calculate the partial derivative of the excess labor demand functions (S x T of these) with respect to either theta or r.
-        #         This partial derivative is used to find the equilibrium on the labor market but also to calculate the derivative dll/dtheta 
-        #         when the model is not partial.
-        #     """
-        #     #unpack
-        #     D = self.est.D
-        #     par = self.par
-
-        #     if theta_or_r == "theta":
-        #         assert len(self.est.gs) == 1
-        #         if "utility" in self.est.gs:
-        #             du = self.du("utility")
-        #             dv = self.dv_and_dEV(du, "utility")
-        #             dP = self.dP(dv, "utility")
-        #             dHsup = self.dHsup(D, dP, "utility")
-        #             # dP =  P[..., np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
-        #             # dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)] * \
-        #             #         np.sum(D[(..., np.newaxis) + (np.newaxis,)] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
-        #             dED = - dHsup #parameters cannot affect demand in the model so I simply leave it out
-
-        #     elif theta_or_r == "r":
-                
-        #         ts_indexes = self.ts_indexes
-                
-        #         du = self.du("r")
-        #         dv = self.dv_and_dEV(du, "r")
-        #         dP = self.dP(dv, "r")
-        #         dHsup = self.dHsup(D, dP, "r")
-
-        #         # dP =  P[..., np.newaxis, np.newaxis]/par.sigma * (dv -  np.sum(P[..., np.newaxis, np.newaxis] * dv, axis=3)[:, :, :, np.newaxis, ...])
-        #         # dHsup =  par.MASS[(slice(None), np.newaxis) + (np.newaxis,)*2] * \
-        #         #          np.sum(D[(..., np.newaxis) + (np.newaxis,)*2] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
-
-        #         dHdem = np.zeros((par.T, par.S, par.T, par.S))
-        #         dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
-
-        #         dED = dHdem - dHsup
-        #     return dED
-
     def du(self, g):
         """ Calculates du with respect to some group of parameters, e.g. utility parameters, sigma or r. This choice determines the functional form
             implicitly (or if you look in the code actually, explicitly) used to calculate du. """
@@ -106,9 +66,9 @@ class gradients:
                 if para == "beta0":
                     du[..., pte[para], theta_idx[para]] = w[..., pte[para]] * par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(par.scale, para)
                 elif para == "xi_in":
-                    du[:, :, :, pte[para], theta_idx[para]] = - par.M[:, :, np.newaxis, pte[para]]
+                    du[:, :, :, pte[para], theta_idx[para]] = - par.M[:, :, np.newaxis, pte[para]] / getattr(par.scale, para)
                 elif para == "xi_out":
-                    du[pte[para], :, :, :, theta_idx[para]] = - par.M[pte[para], :, np.newaxis, :]
+                    du[pte[para], :, :, :, theta_idx[para]] = - par.M[pte[para], :, np.newaxis, :] / getattr(par.scale, para)
                 elif para == "kappa0":
                     du[:, :, :, :, theta_idx[para]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
                                                       par.ages[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis] / getattr(par.scale, para)
@@ -129,26 +89,6 @@ class gradients:
             du[:, :, ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = np.repeat(H, par.T, axis=1)[np.newaxis, ...]  
         #note: dimensions of du vary depending on g
         return du
-
-        # def dlnP(self, theta_or_r):
-        #     """ Calculates dlnP with respect to either the parameter vector (theta) or skill prices (r). The choice of this determined by the argument
-        #         theta_or_r. The function calculates du, and from this dv, and then finally dlnP from dv. 
-        #     """
-        #     assert theta_or_r in ["theta", "r"]
-        #     if theta_or_r == "theta":
-        #         assert len(self.est.gs) == 1
-        #         if "utility" in self.est.gs:
-        #             #Assumes only utility for now
-        #             du = self.du("utility")
-        #             dv = self.dv_and_dEV(du, "utility") #så længe det er utility-parametre, kan denne køre på samme måde med alle parametrene (ligning 44)
-        #             dlnP = 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
-                    
-        #     if theta_or_r == "r":
-        #         du = self.du("r")
-        #         dv = self.dv_and_dEV(du, "r")
-        #         dlnP = 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
-                
-        #     return dlnP
 
     def dv_and_dEV(self, du, g):
         """ Calculates dv and dEV from du. g specifies whether the derivative is with respect to r or parameters, since this determines whether we have
@@ -201,46 +141,41 @@ class gradients:
         # This concludes the calculation of the expected value function derivatives (wrt. beta0)
         return dv
 
-        # def partial_ll(self, dlnP):
-        #     """ The partial derivative of the log likelihood can be calculated from dlnP/dtheta which is the input to this function. 
-        #         To calculate this derivative, dlnP is evaluated in all the data points from the estimation sample. 
-        #     """
-        #     d = self.est.simulated_data
-        #     return np.sum(dlnP[d["slag"], d["a"] - self.par.a_min, d["t"], d["s"], ...], axis=0) / self.est.loglik_scale
-
     def dED_dr(self):
         """ This function is used only when we are only interested in the derivative wrt. r, i.e. for the equilibrum determination. """
-        
-        #unpack
-        ts_indexes = self.ts_indexes
-        par = self.par
-
         du = self.du("r")
         dv = self.dv_and_dEV(du, "r")
         dP = self.dP(dv, "r")
 
-        dHsup = self.dHsup(dP, "r")
+        dED = self.dHdem_dr() - self.dHsup(dP, "r")
+        return dED
+
+    def dHdem_dr(self):
+        par = self.par
+        ts_indexes = self.ts_indexes
         dHdem = np.zeros((par.T, par.S, par.T, par.S))
         dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = \
             np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
-        dED = dHdem - dHsup
-        return dED
+        return dHdem
+
+    def dlnP(self, dv, g):
+        if g is "r":
+            return 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
+        elif g is "utility":
+            return 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
 
     def ll_gradients(self):
         """ Calculates analytic gradients of the log likelihood function. 
             When the model is solved in partial mode, this assumes dr/dtheta = 0 and so only the partial effect dll/dtheta remains.
         """
         #todo: når sigma kommer ind skal der laves om her.
-        ts_indexes = self.ts_indexes
         par = self.par
-        
 
         #noget omkring "utiltiy" her skal ændres senere til "sigma" osv også.
         if self.partial_model:
             du = self.du("utility")
             dv = self.dv_and_dEV(du, "utility") #så længe det er utility-parametre, kan denne køre på samme måde med alle parametrene (ligning 44)
-            dlnP = 1/par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
-            return dlnP
+            return self.dlnP(dv, "utility")
         else:
             T = par.T
             S = par.S
@@ -253,17 +188,11 @@ class gradients:
             dP = self.dP(dv, "r")
             dHsup = self.dHsup(dP, "r")
 
-            #lav en ny method: dHdem()
-            #lav en ny method: dlnP(g)
-
-            dHdem = np.zeros((par.T, par.S, par.T, par.S))
-            dHdem[ts_indexes[:, 0], ts_indexes[:, 1], ts_indexes[:, 0], ts_indexes[:, 1]] = \
-                np.reshape(par.alpha1 * par.pY / (- np.square(par.r)), (par.T*par.S), order="F")
-            dED = dHdem - dHsup
+            dED = self.dHdem_dr() - dHsup
             dED_dr_inv = np.linalg.inv(dED.swapaxes(0, 1).swapaxes(2, 3).reshape((T*S, T*S), order="C"))
 
             #To be outputted
-            dlnP_dr = 1/par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
+            dlnP_dr = self.dlnP(dv, "r")
             
             #Theta derivatives
             #du and dv enter both deD and dlnP
@@ -275,69 +204,7 @@ class gradients:
             dED = - dHsup #parameters cannot affect demand in the model so I simply leave it out
 
             #the two outputs
-            dlnP_dtheta = 1/par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+            dlnP_dtheta = self.dlnP(dv, "utility")
             dr_dtheta = np.matmul(dED_dr_inv, - dED.reshape((T*S, self.est.n_params["total"]), order="F"))
 
             return (dr_dtheta, dlnP_dtheta, dlnP_dr)
-            
-            # #Unpack
-            # # w = self.sol.w
-            # P = self.sol.P
-            # # pte = self.est.pars_to_estimate
-            # # theta_idx = self.est.theta_idx
-
-            # #Containers for results
-            # dEV = np.zeros(self.sol.EV.shape + (self.est.n_params,))
-            # # du = np.zeros(P.shape + (self.est.n_params,))
-
-            # #Assumes that only utility parameters are to be estimated FOR NOW.
-            
-            # du = self.du("utility")
-            # dv = np.zeros(P.shape + (self.est.n_params,)) #derivatives of choice-specific value functions
-
-            # #todo: VI KAN KUN ESTIMERE 1 PARAMETER LIGE NU, OG DET ER BETA0. 
-            # #beta0 og xi-parametre skal sættes sammen, da alt fra dv kan vektoriseres. Men sigma kan ikke det samme.
-            # #til sidst skal det hele så samles i en enkelt dlnP. 
-            # #JEG udvikler dette når jeg har skrevet overleaf omkring ligevægtsgradienter OG sendt dem til Bertel.
-            # # parameter = "beta0"
-            # # for parameter in pte:
-            # #Derivative of utility wrt. beta0. Calculated for all state space points once-and-for-all
-
-            # # du[..., pte[parameter], theta_idx[parameter]] = w[..., pte[parameter]] * self.par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(self.par.scale, parameter)
-
-            # a = self.par.a_max - self.par.a_min
-
-            # #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
-            # dv[:, a, ...] = du[:, a, ...]
-
-            # #Next, the last age, dEV
-            # #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
-            # #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
-            # dEV[:, a, :, :] = np.sum(P[:, a, :, :, np.newaxis] * dv[:, a, ...], axis=2)
-
-            # # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
-            # # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
-            # # with age a + 1. 
-            # while a > 0:
-            #     a -= 1
-            #     dv[:, a, self.par.T - 1, :, :] = du[:, a, self.par.T - 1, :, :] + self.par.rho * dEV[:, a + 1, self.par.T - 1, :][np.newaxis, :, :]
-            #     #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
-            #     dEV[:, a, self.par.T - 1, :] = np.sum(P[:, a, self.par.T - 1, :, np.newaxis] * dv[:, a, self.par.T - 1, :, :], axis=1)
-
-            # #Now we can perform proper time iteration for the remaining ages.
-            # t = self.par.T - 1
-            # while t > 0:
-            #     t -= 1
-            #     #Choice specific value function derivatives. 
-            #     dv[:, :-1, t, :, :] = du[:, :-1, t, :, :] + self.par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1)[np.newaxis, ...]
-            #     dEV[:, :-1, t, :] = np.sum(P[:, :-1, t, :, np.newaxis] * dv[:, :-1, t, :, :], axis=2)
-
-            # # This concludes the calculation of the expected value function derivatives (wrt. beta0)
-            # # Next, calculate the derivatives of the choice probabilities. 
-            # # This is made easier by the fact that we have already calculated dv.
-
-            # dlnP = np.zeros((P.shape) + (self.est.n_params,)) #can be commented since it actually not used.
-            # #this is the dv of the choice minus a log sum, where after summing over k, we create the s dimension again
-            # dlnP = 1/self.par.sigma * (dv - np.sum(P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
-
-            # return dlnP

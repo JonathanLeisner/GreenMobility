@@ -137,10 +137,12 @@ class GM:
         #Switching costs (direct utility costs)
         if self.name == "high_switchingcost":
             par.xi_in = 20 * np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
-            par.xi_out = 20 * np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()    
+            par.xi_out = 20 * np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
         else:
-            par.xi_in = np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
-            par.xi_out = np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
+            par.xi_in = 10 * np.array([0.04, 0.05, 0.06, 0.07])[:par.S]
+            par.xi_out = 10 * np.array([0.03, 0.06, 0.09, 0.07])[:par.S].transpose()
+        par.scale.xi_in = 10
+        par.scale.xi_out = 10
 
         #Individual characteristics scaler of moving costs
         par.kappa0 = 1
@@ -170,7 +172,7 @@ class GM:
 
     def c_m1(self):
         par = self.par
-        m1 = np.exp(np.sum(np.meshgrid(par.xi_in, par.xi_out), axis=0)) #add cost of going OUT of a sector with the cost of going IN to a sector.
+        m1 = np.exp(np.sum(np.meshgrid(par.xi_in / par.scale.xi_in, par.xi_out / par.scale.xi_out), axis=0)) #add cost of going OUT of a sector with the cost of going IN to a sector.
         np.fill_diagonal(m1, 0) #Not switching sector is costless
         return m1
 
@@ -807,20 +809,23 @@ class GM:
         else:
             return quadED
 
-    def avg_yearly_transition_rates(self, data=True):
-        print(output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).avg_yearly_transition_rates(data=data))
+    def output(self):
+        return output.output(self.par, self.sol, self.sim, self.est, self.name, self.version)
 
-    def age_profile_switching(self, save=False):
-        output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).age_profile_switching(save=save)
+    def t_avg_yearly_transition_rates(self, data=True):
+        print(self.output().avg_yearly_transition_rates(data=data))
 
-    def time_profile_switching(self, save=False):
-        output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).time_profile_switching(save=save)
+    def f_age_profile_switching(self, save=False):
+        self.output().f_age_profile_switching(save=save)
 
-    def fig_employment_shares(self, save=False):
-        output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).fig_employment_shares(save=save)
+    def f_time_profile_switching(self, save=False):
+        self.output().f_time_profile_switching(save=save)
 
-    def fig_avg_wages(self, save=False):
-        output.output(self.par, self.sol, self.sim, self.est, self.name, self.version).fig_avg_wages(save=save)
+    def f_employment_shares(self, save=False):
+        self.output().f_employment_shares(save=save)
+
+    def f_avg_wages(self, save=False):
+        self.output().f_avg_wages(save=save)
 
 #%% Initiate model using the saved data from the testing cell below
 
@@ -891,7 +896,7 @@ for s in np.arange(gm.par.S):
         n += 1
 
 #Loglik gradient checks (partial model and in general equilibrium)
-gm.setup_estimation(parameters=["kappa1", "beta0", "kappa0", "xi_in", "xi_out"], indexes=None, agrad_loglik=False)
+gm.setup_estimation(parameters=["xi_in", "xi_out"], indexes=None, agrad_loglik=False)
 gm.partial_model = True
 
 # loglik gradient in the partial model:
@@ -902,7 +907,6 @@ assert util.check_grad(x0=initvals, f=gm.ll_objfunc, jac=gm.score_from_theta) < 
 gm.partial_model = False
 theta0 = gm.est.theta0.copy() 
 res = optimize.approx_fprime(theta0, gm.ll_objfunc, 1.4901161193847656e-08)
-gm.score_from_theta(theta0)
 assert util.check_grad(theta0, gm.ll_objfunc, gm.score_from_theta) < 1e-7, "Loglikelihood does not work"
 
 #Save data before moving parameters
