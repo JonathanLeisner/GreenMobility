@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import optimize
 from numpy.random import default_rng
+import pickle
 # from mpl_toolkits import mplot3d
 
 np.set_printoptions(precision=3)
@@ -29,11 +30,11 @@ def update_attrs(ns, **kwargs):
     for k, v in kwargs.items():
         setattr(ns, k, v)
 
-def get_key_from_value(dict, value):
+def get_key_from_value(dictionary, value):
     """ Helper function for finding the key of specific value in a dictionary. 
         The value must only exist under one key, otherwise an error is thrown.
     """
-    keys = [k for k in dict.keys() if value in dict[k]]
+    keys = [k for k in dictionary.keys() if value in dictionary[k]]
     assert len(keys) == 1
     return keys[0]
 
@@ -156,7 +157,8 @@ class GM:
         par.scale.kappa1 = 1000
 
         #Define parameter groups. These are used in self.gradient().
-        par.groups = {"sigma":["sigma"], "utility":["beta0", "xi_in", "xi_out", "kappa0", "kappa1"], "r":["r"]}
+        par.groups = OrderedDict([("sigma", ["sigma"]), ("utility", ["beta0", "xi_in", "xi_out", "kappa0", "kappa1"])])
+        # par.groups = {"sigma":["sigma"], "utility":["beta0", "xi_in", "xi_out", "kappa0", "kappa1"], "r":["r"]}
 
         # #Replace default values by those given explicitly to the method
         for k, v in kwargs.items():
@@ -213,8 +215,9 @@ class GM:
         sol = self.sol
         par = self.par
 
-        sol.P = np.zeros((par.S, par.N_ages, par.T, par.S)) - 1 #4 dimensions: slag, a, t, s (choice)
-        sol.EV = np.zeros((par.S, par.N_ages, par.T)) - 99 #3 dimensions: slag, a, t
+        sol.P = np.zeros((par.S, par.N_ages, par.T, par.S)) #4 dimensions: slag, a, t, s (choice)
+        sol.EV = np.zeros((par.S, par.N_ages, par.T)) #3 dimensions: slag, a, t
+        sol.v = np.zeros((par.S, par.N_ages, par.T, par.S))
 
     def precompute(self):
         """ Calculates the wages offered in each sector at each point in the state space. 
@@ -251,7 +254,7 @@ class GM:
         """ Solve the worker's problem by backwards induction for a given set of skill prices (r). 
             First we solve the last period using static expectations. Then we perform backwards 
             iteration from the remaining periods until period t = 0 using rational expectations. """
-        
+
         #Unpack solution objects
         par = self.par
         sol = self.sol
@@ -259,26 +262,30 @@ class GM:
         M = par.M #utility switching cost
         P = sol.P #conditional choice probabilities
         EV = sol.EV #expected value functions
+        v = sol.v #alternative-specific value functions
 
         #PART 0: Precompute EV at the retirement age for all periods (no continuation values)
-        a = par.N_ages - 1        
-        (EV[:, a, :], P[:, a, :, :]) = self.closed_forms(par.sigma, w[np.newaxis, a, :, :] - M[:, a, np.newaxis, :])
+        a = par.N_ages - 1
+        v[:, a, :, :] = w[np.newaxis, a, :, :] - M[:, a, np.newaxis, :]
+        (EV[:, a, :], P[:, a, :, :]) = self.closed_forms(par.sigma, v[:, a, :, :])
 
         #PART I (age iteration (64 -> 30) within the terminal period, static expectation)
         t = par.T - 1
         for a in reversed(np.arange(par.N_ages - 1)):
-            V_alternatives = w[np.newaxis, a, t, :] - M[:, a, :] + par.rho * EV[np.newaxis, :, a + 1, t]
+            v[:, a, t, :] = w[np.newaxis, a, t, :] - M[:, a, :] + par.rho * EV[np.newaxis, :, a + 1, t]
             # My choice of sector today enters EV tomorrow as slag. 
             # Therefore the last dimension of w (the choice) must match the first dimension of EV (slag) 
-            (EV[:, a, t], P[:, a, t, :]) = self.closed_forms(par.sigma, V_alternatives)
+            (EV[:, a, t], P[:, a, t, :]) = self.closed_forms(par.sigma, v[:, a, t, :])
 
         #PART II (time iteration from T - 2 to 0.)
         t = par.T - 2
         for t in reversed(np.arange(par.T - 1)):
             # The value of an alternative is wage minus mobility costs + next period's continuation value discounted. 
             # Again, the transpose() and newaxis on EV makes sure that the choice dimension of w and M lines up with the slag dimension of EV.
-            V_alternatives =  w[np.newaxis, :-1, t, :] - M[:, :-1, :] + par.rho * EV[:, 1:, t + 1].transpose()[np.newaxis, :, :]
-            (EV[:, :-1, t], P[:, :-1, t, :]) = self.closed_forms(par.sigma, V_alternatives)
+            v[:, :-1, t, :] =  w[np.newaxis, :-1, t, :] - M[:, :-1, :] + par.rho * EV[:, 1:, t + 1].transpose()[np.newaxis, :, :]
+            (EV[:, :-1, t], P[:, :-1, t, :]) = self.closed_forms(par.sigma, v[:, :-1, t, :])
+
+        assert np.all(np.isclose(np.sum(P, axis=-1), 1))
 
     def c_D_from_data(self, simulated_data=True):
         """ Calculates the variable D in the paper. The variable is defined over all state space points (Omega), 
@@ -395,41 +402,46 @@ class GM:
             attribute in par, or (2): if parameters from multiple attributes are to be estimated, 'indexes' 
             should be a list. The list can contain either arrays or None values. The value None implies that all
             parameters in the attribute will be estimated. """
-        pars_to_estimate = OrderedDict()
-
+        
         #default values
         if parameters is None:
             parameters = ["beta0"]
         if indexes is None:
             indexes = [None] * len(parameters)
+        
+        self.est.groups_to_estimate = OrderedDict()
+        for k, p_list in self.par.groups.items():
+            pars = [p for p in p_list if p in parameters]
+            if len(pars) > 0:
+                self.est.groups_to_estimate[k] = pars
 
+        pars_to_estimate = OrderedDict()
         if isinstance(indexes, np.ndarray):
             #if only an array is given in 'indexes' it must refer to the index of only one parameter to be estimated
             assert len(parameters) == 1 
             pars_to_estimate[parameters[0]] = indexes
         else:
-            for i, par in enumerate(parameters):
-                if indexes[i] is None:
-                    pars_to_estimate[par] = self.c_index_array(getattr(self.par, par))
-                else:
-                    assert isinstance(indexes[i], np.ndarray)
-                    pars_to_estimate[par] = indexes[i]
+            for _, pars in self.est.groups_to_estimate.items(): #looping through groups insures the ordering of groups is intact. Will never be util0, sigma, util1 etc.
+                for par in pars:
+                    index = indexes[parameters.index(par)]
+                    if index is None:
+                        pars_to_estimate[par] = self.c_index_array(getattr(self.par, par))
+                    else:
+                        assert isinstance(index, np.ndarray)
+                        pars_to_estimate[par] = index
         self.est.pars_to_estimate = pars_to_estimate
-        #Follow-up helper objects
-        self.c_n_params()
-        self.c_gs()
 
     def c_n_params(self):
         """ Calculates n_params, which is a dictionary with parameter groups as keys and the number of parameters 
             to be estimated within each group as values.
         """
-        n_params = {**{"total":0}, **{k:0 for k in self.par.groups.keys() if k is not "r"}}
+        n_params = {**{"full":0}, **{k:0 for k in self.par.groups.keys() if k is not "r"}}
         for p, index in self.est.pars_to_estimate.items():
             if index is None:
-                n_params["total"] += 1
+                n_params["full"] += 1
                 n_params[get_key_from_value(self.par.groups, p)] += 1
             else:
-                n_params["total"] += len(index)
+                n_params["full"] += len(index)
                 n_params[get_key_from_value(self.par.groups, p)] += len(index)
         self.est.n_params = n_params
 
@@ -438,21 +450,28 @@ class GM:
         self.est.gs = set([g for g in self.par.groups.keys() for p in self.est.pars_to_estimate if p in self.par.groups[g]])
 
     def c_theta_idx(self):
-        """ Construct a dictionary with parameters to be estimated as keys. 
-            The values are arrays that indicate these parameters' positions in the theta-vector (the 1-D vector of parameters to be estimated)
+        """ Construct a two-layered dictionary. The upper level is a dictionary with parameters to be estimated as keys.
+            The lower level of keys defines parameter groups g ('full', 'utility' or 'sigma') depending on the parameter. 
+            The values are arrays that indicate these parameters' positions in the theta-vector (the 1-D vector of parameters to be estimated) and
+            the vector parameters in the corresponding subgroup. 
         """
         pte = self.est.pars_to_estimate
 
-        n = 0
+        #helper object for counting
+        n = {**{"full":0}, **{k:0 for k in self.par.groups.keys()}}
         theta_idx = OrderedDict()
         for parameter, index in pte.items():
+            g = get_key_from_value(self.par.groups, parameter)
             if index is not None:
-                theta_idx[parameter] = np.arange(n, n + len(index))
-                n += len(index)
+                theta_idx[parameter] = {"full":np.arange(n["full"], n["full"] + len(index)), g:np.arange(n[g], n[g] + len(index))}
+                n["full"] += len(index)
+                n[g] += len(index)
             else:
                 #scalar parameter vector
-                theta_idx[parameter] = np.array([n])
-                n += 1
+                theta_idx[parameter] = {"full":np.array([n["full"]]), g:np.array([n[g]])}
+                n["full"] += 1
+                n[g] += 1
+
         self.est.theta_idx = theta_idx
 
     def c_theta0(self):
@@ -465,16 +484,14 @@ class GM:
         #Initialize theta0 with the correct length.
         # theta0 = np.zeros(np.sum([len(pte[k]) if pte[k] is not None else 1 for k in pte]))
         # theta0 = np.zeros(max(theta_idx[next(reversed(theta_idx))]) + 1) #last element of theta_idx stores the
-        theta0 = np.zeros(self.est.n_params["total"])
+        theta0 = np.zeros(self.est.n_params["full"])
         # n = 0 #counter for index in theta0 itself
 
         for par, index in pte.items():
             if index is None:
-                theta0[theta_idx[par]] = getattr(self.par, par)
-                # n += 1
+                theta0[theta_idx[par]["full"]] = getattr(self.par, par)
             else:
-                theta0[theta_idx[par]] = getattr(self.par, par)[index]
-                # n += len(index)
+                theta0[theta_idx[par]["full"]] = getattr(self.par, par)[index]
         self.est.theta0 = theta0
 
     @staticmethod
@@ -516,7 +533,10 @@ class GM:
             'agrad_loglik' controls whether to use numeric approximations for gradients or 
             the analytic gradients. """
         self.c_pars_to_estimate(parameters=parameters, indexes=indexes)
+        self.c_n_params()
+        self.c_gs()
         self.c_theta_idx()
+
         self.c_theta0()
         if method is None:
             method = self.est.default_method
@@ -681,7 +701,7 @@ class GM:
 
     def plot_ll_3d(self, x_values, y_values):
         """ Plot the loglikelihood as a function of two parameters."""
-        assert self.est.n_params["total"] == 2, "Exactly 2 parameters must be chosen for plotting."
+        assert self.est.n_params["full"] == 2, "Exactly 2 parameters must be chosen for plotting."
 
         z = np.zeros((len(x_values)*(len(y_values))))
 
@@ -749,7 +769,8 @@ class GM:
             self.precompute_w() #only wages need to be updated when the only thing we change is r
             self.solve_worker()
             self.simulate()
-            
+
+        #todo: lav helper function til at kalde classes fra de andre moduler    
         return gradients.gradients(self.par, self.sol, self.est, self.partial_model).dED_dr() #Draws upon the gradient class in the gradient module
 
     def c_jac_quadED(self, r=None, ED=None):
@@ -855,13 +876,45 @@ class GM:
 #%% Initiate model using the saved data from the testing cell below
 
 gm = GM(endo_D=False)
-gm.l_data("data_equilibrium_default_values.pkl")
+# gm.l_data("data_equilibrium_default_values.pkl")
 gm.setup()
+gm.partial_model = True
+# gm.sim.endo_D = True
 gm.allocate()
 gm.precompute()
+gm.solve_worker()
+gm.c_simulated_data()
 gm.l_cohorts()
 gm.l_init_distribution()
-gm.solve_worker()
+gm.c_D_from_data()
+gm.simulate()
+gm.setup_estimation(parameters=["beta0", "sigma", "kappa0"], indexes=[np.array([0, 1]), None, None])
+gm.c_theta0()
+#%%
+
+importlib.reload(gradients)
+
+gm.estimate()
+
+
+#%%
+
+
+#save
+# picklefile = open("sol_before", "wb")
+# pickle.dump(gm.sol, picklefile)
+# picklefile.close()
+#old
+picklefile = open("sol_before", "rb")
+old_sol = pickle.load(picklefile)
+picklefile.close()
+
+assert old_sol.__dict__.keys() == gm.sol.__dict__.keys()
+for k, arr in old_sol.__dict__.items():
+    assert np.all(arr == gm.sol.__dict__[k])
+
+
+
 gm.c_D_from_data()
 gm.simulate()
 
@@ -919,20 +972,23 @@ for s in np.arange(gm.par.S):
         g = lambda x: gm.dED_dr(x)[t, s, :, :].reshape((gm.par.T * gm.par.S), order="F")
         assert util.check_grad(x0=r_1d, f=f, jac=g) < 1e-7, "Inner solver gradient wrong"
         n += 1
-
+#%% PART II
 #Loglik gradient checks (partial model and in general equilibrium)
-gm.setup_estimation(parameters=["xi_in", "xi_out"], indexes=None, agrad_loglik=False)
+gm.setup_estimation(parameters=["beta0", "sigma"], indexes=None, agrad_loglik=False)
 gm.partial_model = True
 
 # loglik gradient in the partial model:
+gm.c_theta0()
 initvals = gm.est.theta0.copy()
+gm.score_from_theta(initvals)
+res = optimize.approx_fprime(initvals, gm.ll_objfunc, 1.4901161193847656e-8)
 assert util.check_grad(x0=initvals, f=gm.ll_objfunc, jac=gm.score_from_theta) < 1e-7
 
-# loglik gradient in general equlibrium model
+# loglik gradient in general equilibrium model
 gm.partial_model = False
-theta0 = gm.est.theta0.copy() 
-res = optimize.approx_fprime(theta0, gm.ll_objfunc, 1.4901161193847656e-08)
-assert util.check_grad(theta0, gm.ll_objfunc, gm.score_from_theta) < 1e-7, "Loglikelihood does not work"
+theta0 = gm.est.theta0.copy()
+gm.score_from_theta(initvals) - optimize.approx_fprime(theta0, gm.ll_objfunc, 1.4901161193847656e-8)
+assert util.check_grad(theta0, gm.ll_objfunc, gm.score_from_theta, epsilon=1.4901161193847656e-8) < 1e-7, "Loglikelihood does not work"
 
 #Save data before moving parameters
 gm.find_humcap_equilibrium()

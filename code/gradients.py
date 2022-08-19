@@ -27,10 +27,14 @@ class gradients:
         P = self.sol.P
         par = self.par
 
-        ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
+        if g is "sigma":
+            dP = (P * ((dv * self.par.sigma - self.sol.v) / np.square(self.par.sigma) - \
+                  np.sum(self.sol.P * (dv * self.par.sigma - self.sol.v) / np.square(self.par.sigma), axis=-1)[..., np.newaxis])
+                 )[..., np.newaxis]
+        else:
+            ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
+            dP = P[(...,) + ndim_add]/par.sigma * (dv -  np.sum(P[(...,) + ndim_add] * dv, axis=3)[:, :, :, np.newaxis, ...])
         
-        dP = P[(...,) + ndim_add]/par.sigma * (dv -  np.sum(P[(...,) + ndim_add] * dv, axis=3)[:, :, :, np.newaxis, ...])
-        #this functional form might change with sigma!
         return dP
 
 
@@ -40,7 +44,7 @@ class gradients:
             Expressions for D and dP must be supplied as well. Implicitly, this function assumes that D is constant and so D' can be ignored.
         """
 
-        ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,)}.get(g)
+        ndim_add = {"r":(np.newaxis, np.newaxis), "utility":(np.newaxis,), "sigma":(np.newaxis,)}.get(g)
         dHsup =  self.par.MASS[(slice(None), np.newaxis) + ndim_add] * \
                         np.sum(self.est.D[(..., np.newaxis) + ndim_add] * dP, axis=tuple(np.arange(0, len(self.sol.EV.shape) - 1)))
         return dHsup
@@ -63,16 +67,16 @@ class gradients:
             du = np.zeros(self.sol.P.shape + (self.est.n_params[g],))
             for para in [k for k in pte.keys() if k in par.groups[g]]: #could this be precomputed? Yes, in setup_estimation perhaps. 
                 if para == "beta0":
-                    du[..., pte[para], theta_idx[para]] = w[..., pte[para]] * par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(par.scale, para)
+                    du[..., pte[para], theta_idx[para][g]] = w[..., pte[para]] * par.ages[np.newaxis, :, np.newaxis, np.newaxis] / getattr(par.scale, para)
                 elif para == "xi_in":
-                    du[:, :, :, pte[para], theta_idx[para]] = - par.M[:, :, np.newaxis, pte[para]] / getattr(par.scale, para)
+                    du[:, :, :, pte[para], theta_idx[para][g]] = - par.M[:, :, np.newaxis, pte[para]] / getattr(par.scale, para)
                 elif para == "xi_out":
-                    du[pte[para], :, :, :, theta_idx[para]] = - par.M[pte[para], :, np.newaxis, :] / getattr(par.scale, para)
+                    du[pte[para], :, :, :, theta_idx[para][g]] = - par.M[pte[para], :, np.newaxis, :] / getattr(par.scale, para)
                 elif para == "kappa0":
-                    du[:, :, :, :, theta_idx[para]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
+                    du[:, :, :, :, theta_idx[para][g]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
                                                       par.ages[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis] / getattr(par.scale, para)
                 elif para == "kappa1":
-                    du[:, :, :, :, theta_idx[para]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
+                    du[:, :, :, :, theta_idx[para][g]] = - par.M[:, :, np.newaxis, :, np.newaxis] * \
                                                       np.square(par.ages[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis]) / getattr(par.scale, para)
                 else:
                     raise Exception()
@@ -89,56 +93,77 @@ class gradients:
         #note: dimensions of du vary depending on g
         return du
 
+    def dv_and_dEV_sigma(self):
+        #unpack
+        par = self.par
+        P = self.sol.P
+        v = self.sol.v
+        EV = self.sol.EV
+
+        dEV = np.zeros(EV.shape) #with sigma, no need to add an extra dimension, since it has length 1 anyways and so is redundant.
+        dv = np.zeros(v.shape)
+
+        a = par.a_max - par.a_min
+        dEV[:, a, :] = EV[:, a, :] / par.sigma + np.sum(P[:, a, ...] * ((dv[:, a, ...] * par.sigma - v[:, a, ...]) / par.sigma), axis=-1)
+
+        #age iteration for the final period
+        while a > 0:
+            a -= 1
+            dv[:, a, par.T - 1, :] = par.rho * dEV[np.newaxis, :, a, par.T - 1]
+            dEV[:, a, par.T - 1] = EV[:, a, par.T - 1] / par.sigma + \
+                                np.sum(P[:, a, par.T - 1, :] * ((dv[:, a, par.T - 1, :] * par.sigma - v[:, a, par.T - 1, :]) / par.sigma), axis=-1)
+
+        #time iteration for all remaining ages
+        t = par.T - 1
+        while t > 0:
+            t -= 1
+            dv[:, :-1, t, :] = par.rho * dEV[:, 1:, t + 1].swapaxes(0, 1)[np.newaxis, ...]
+            dEV[:, :-1, t] = EV[:, :-1, t] / par.sigma + np.sum(P[:, :-1, t, :] * ((dv[:, :-1, t, :] * par.sigma - v[:, :-1, t, :]) / par.sigma), axis=-1)
+
+        return dv
+
     def dv_and_dEV(self, du, g):
         """ Calculates dv (alternative-specific value function derivatives) and dEV (expected value function derivatives) from du. 
             g specifies whether the derivative is with respect to r or parameters, since this determines whether we have
             to add two dimensions or one (since r is defined over s and t while parameters are collected in one dimension). 
             The function only returns dv since dEV is never necessary to know on its own if we know dv.
             The calculation of derivatives follows the same backwards recursion structure as the solution to the worker's problem.
+            If g == "sigma", the functional forms change and I use the method dv_and_dEV_sigma to calculate the derivative dv.
         """
 
         #unpack
         par = self.par
         P = self.sol.P
 
-        
         if g is "r":
-            ndim_add = (np.newaxis, np.newaxis) #when differentiating wrt. r, there are two additional dimensions (t' and s')
+            ndim_add = (np.newaxis, np.newaxis)
             shape_add = (par.T, par.S)
         elif g is "utility":
-            ndim_add = (np.newaxis,) #all other derivatives are simply a parameter vector dimension
+            ndim_add = (np.newaxis,)
             shape_add = (self.est.n_params[g],)
 
-        dEV = np.zeros(self.sol.EV.shape + shape_add) #her tager den alle parametrene, selvom det kun er dem i utility vi regner på nu. kommer fejl senere.
-        dv = np.zeros(P.shape + shape_add) #derivatives of choice-specific value functions
+        dEV = np.zeros(self.sol.EV.shape + shape_add)
+        dv = np.zeros(P.shape + shape_add)
 
-        #Now we can fill in dv for the last age. There are no continuation values, so only the marginal wage effect matters
+        #Age 65
         a = par.a_max - par.a_min
         dv[:, a, ...] = du[:, a, ...]
-
-        #Next, the last age, dEV
-        #Equation 41: Multiply P and dv for all s, and sum over s afterwards. We get positive values for all combinations of (slag x t),
-        #because the expected value of the terminal period goes up no matter which of the wages we change through beta0. 
         dEV[:, a, :, ...] = np.sum(P[(slice(None), a, slice(None), slice(None)) + ndim_add] * dv[:, a, ...], axis=2)
 
-        # Derivative for younger people in the last period: use continuation values from age + 1 in the same period.
-        # We have to iterate on age, because the continuation value of someone with age a uses the continuation value of someone
-        # with age a + 1. 
+        # a < 65, t = terminal period. Use continuation values from age + 1 in the same period. We have to iterate on age
+        # because the continuation value of someone with age a uses the continuation value of someone with age a + 1. 
         while a > 0:
             a -= 1
             dv[:, a, par.T - 1, ...] = du[:, a, par.T - 1, ...] + par.rho * dEV[:, a + 1, par.T - 1, ...][np.newaxis, ...]
             #Here we match s in P with slag in dEV because the choice today becomes the lagged choice tomorrow
             dEV[:, a, par.T - 1, ...] = np.sum(P[(slice(None), a, par.T - 1, slice(None)) + ndim_add] * dv[:, a, par.T - 1, ...], axis=1)
 
-        #Now we can perform proper time iteration for the remaining ages.
+        #Time iteration for remaining ages
         t = par.T - 1
         while t > 0:
             t -= 1
-            #Choice specific value function derivatives. 
             dv[:, :-1, t, ...] = du[:, :-1, t, ...] + par.rho * dEV[:, 1:, t + 1, :].swapaxes(0, 1)[np.newaxis, ...]
             dEV[:, :-1, t, ...] = np.sum(P[(slice(None), slice(None, -1), t, slice(None)) + ndim_add] * dv[:, :-1, t, ...], axis=2)
-
-        # This concludes the calculation of the expected value function derivatives (wrt. beta0)
         return dv
 
     def dED_dr(self):
@@ -163,11 +188,15 @@ class gradients:
     def dlnP(self, dv, g):
         """ Calculate the derivatives of log choice probabilities, the only component of the log likelihood function. 
             They are calculated from the derivatives of alternative-specific value functions (dv). 
+            The returned array has dimensions (state space + S + 1)
         """
         if g is "r":
             return 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis, np.newaxis] * dv, axis=-3)[:, :, :, np.newaxis, :, :])
         elif g is "utility":
             return 1/self.par.sigma * (dv - np.sum(self.sol.P[..., np.newaxis] * dv, axis=-2)[:, :, :, np.newaxis, :])
+        elif g is "sigma":
+            return ((dv * self.par.sigma - self.sol.v) / np.square(self.par.sigma) - \
+                    np.sum(self.sol.P * (dv * self.par.sigma - self.sol.v) / np.square(self.par.sigma), axis=-1)[..., np.newaxis])[..., np.newaxis]
 
     def ll_gradients(self):
         """ Calculates analytic gradients of the log likelihood function. 
@@ -176,11 +205,21 @@ class gradients:
         #todo: når sigma kommer ind skal der laves om her.
         par = self.par
 
-        #noget omkring "utiltiy" her skal ændres senere til "sigma" osv også.
+        #noget omkring "utility" her skal ændres senere til "sigma" osv også.
         if self.partial_model:
-            du = self.du("utility")
-            dv = self.dv_and_dEV(du, "utility")
-            return self.dlnP(dv, "utility")
+            dlnP = []
+            for g in self.est.groups_to_estimate:
+                if g is "sigma":
+                    dv = self.dv_and_dEV_sigma()
+                else:
+                    du = self.du(g)
+                    dv = self.dv_and_dEV(du, g)
+                dlnP.append(self.dlnP(dv, g))
+            return np.concatenate(dlnP, axis=-1)
+
+            # du = self.du("utility")
+            # dv = self.dv_and_dEV(du, "utility")
+            # return self.dlnP(dv, "utility")
         else:
             T = par.T
             S = par.S
@@ -194,14 +233,20 @@ class gradients:
             dlnP_dr = self.dlnP(dv, "r")
             
             #Theta derivatives
-            du = self.du("utility")
-            dv = self.dv_and_dEV(du, "utility")
-            dP = self.dP(dv, "utility")
-            dHsup = self.dHsup(dP, "utility")
-            dED = - dHsup #parameters cannot affect demand in the model so I simply leave it out
-
-            #the two outputs
-            dlnP_dtheta = self.dlnP(dv, "utility")
-            dr_dtheta = np.matmul(dED_dr_inv, - dED.reshape((T*S, self.est.n_params["total"]), order="F"))
+            dED = []
+            dlnP = []
+            for g in self.est.groups_to_estimate:
+                if g is "sigma":
+                    dv = self.dv_and_dEV_sigma()
+                else:
+                    du = self.du(g)
+                    dv = self.dv_and_dEV(du, g)
+                dlnP.append(self.dlnP(dv, g))
+                dP = self.dP(dv, g)
+                dED.append(- self.dHsup(dP, g)) #parameters cannot affect demand in the model so I simply leave it out (dED = 0 - dHsup)
+            dED = np.concatenate(dED, axis=-1) 
+            dlnP_dtheta = np.concatenate(dlnP, axis=-1)
+            
+            dr_dtheta = np.matmul(dED_dr_inv, - dED.reshape((T*S, self.est.n_params["full"]), order="F"))
 
             return (dr_dtheta, dlnP_dtheta, dlnP_dr)
