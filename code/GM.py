@@ -835,11 +835,8 @@ class GM:
         self.precompute_w() #With new skill prices, update wages
         self.solve_worker()
         self.simulate()
-        # self.solve_worker() #solve the worker's problem
-        # self.simulate()
         #Calculate excess labor demand
         ED = self.c_ED()
-        # objfunc = np.sum(np.abs(ED)) #sum of absolute excess labor demands (scalar function)
         quadED = np.sum(np.square(ED))
         if self.agrad_quadED:
             #Calculate jacobian of objective function (sum(ED^2)) and reshape into 1-D
