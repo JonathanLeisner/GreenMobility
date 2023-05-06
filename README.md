@@ -1,4 +1,3 @@
-# GreenMobility
-Mobility in a green transition
+# Labor Mobility with environmental taxes (Leisner 2023)
 
-This codebase is very preliminary. Currently, the class for running the model is stored in GM.py.
+### This codebase features the programs used to solve, estimate and simulate from the model in Leisner (2023).
